@@ -283,7 +283,58 @@ def _jwt_exp(token: str) -> int:
         return 0
 
 
-def _extract_access_token(text: str) -> str:
+def _find_anycubic_log_token():
+    """Search Anycubic Slicer Next logs for an RS256 token (id_token URL param)."""
+    import glob, os, re
+    log_dirs = [
+        os.path.expanduser("~/Library/Application Support/AnycubicSlicerNext/log"),
+        os.path.expanduser("~/Library/Application Support/Anycubic Slicer Next/log"),
+        os.path.expanduser("~/.config/AnycubicSlicerNext/log"),
+        os.path.expanduser("~/.config/Anycubic Slicer Next/log"),
+    ]
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            log_dirs.extend([
+                os.path.join(appdata, "AnycubicSlicerNext", "log"),
+                os.path.join(appdata, "Anycubic Slicer Next", "log"),
+            ])
+    token_re = re.compile(r"id_token=(eyJhbGciOiJSUzI1NiIsImtpZCI6ImFjX2FwcF9jcnQi[^&\s]{100,})")
+    for log_dir in log_dirs:
+        if not os.path.isdir(log_dir):
+            continue
+        for log_file in sorted(glob.glob(os.path.join(log_dir, "*.log")), key=os.path.getmtime, reverse=True)[:5]:
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                m = token_re.search(content)
+                if m:
+                    return m.group(1)
+            except Exception:
+                continue
+    return None
+
+
+def _anycubic_log_dir():
+    """Return the Anycubic Slicer Next log directory, or None if not found."""
+    import os
+    candidates = [
+        os.path.expanduser("~/Library/Application Support/AnycubicSlicerNext/log"),
+        os.path.expanduser("~/Library/Application Support/Anycubic Slicer Next/log"),
+        os.path.expanduser("~/.config/AnycubicSlicerNext/log"),
+        os.path.expanduser("~/.config/Anycubic Slicer Next/log"),
+    ]
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            candidates.extend([
+                os.path.join(appdata, "AnycubicSlicerNext", "log"),
+                os.path.join(appdata, "Anycubic Slicer Next", "log"),
+            ])
+    for d in candidates:
+        if os.path.isdir(d):
+            return d
+    return None
     """Accept a raw JWT or a pasted JSON blob containing access_token/id_token."""
     text = (text or "").strip().strip('"').strip("'")
     if text.startswith("{"):
@@ -3474,6 +3525,11 @@ LOGIN_DIALOG_HTML = """<!DOCTYPE html>
   button.primary { background: var(--orca-accent, #009688); border-color: var(--orca-accent, #009688);
                    color: var(--orca-accent-fg, #fff); }
   code { font-family: ui-monospace, monospace; }
+  .hint-row { display: flex; gap: 10px; justify-content: flex-start; margin-top: 8px; }
+  .hint-row button { font-size: 11px; padding: 4px 10px; }
+  #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+           padding: 10px 16px; border-radius: 8px; background: rgba(0,0,0,.85); color: #fff;
+           font-size: 12px; display: none; z-index: 100; max-width: 90%; text-align: center; }
 </style>
 </head>
 <body>
@@ -3485,19 +3541,43 @@ LOGIN_DIALOG_HTML = """<!DOCTYPE html>
     You can also paste a whole JSON response containing <code>access_token</code>.
   </div>
   <textarea id="token" rows="7" spellcheck="false" placeholder="eyJhbGciOiJSUzI1NiIs..."></textarea>
+  <div class="hint-row">
+    <button id="btnDetect">Auto-detect from logs</button>
+    <button id="btnOpenLogs">Open log folder</button>
+  </div>
   <div class="row">
     <button id="cancel">Cancel</button>
     <button id="ok" class="primary">Sign in</button>
   </div>
+  <div id="toast"></div>
 <script>
 (function () {
+  var orca = window.orca;
   function submit() {
     var token = (document.getElementById("token").value || "").trim();
     if (!token) { document.getElementById("token").focus(); return; }
-    window.orca.submit({ token: token });
+    orca.submit({ token: token });
+  }
+  function showToast(msg) {
+    var t = document.getElementById("toast");
+    t.textContent = msg;
+    t.style.display = "block";
+    setTimeout(function () { t.style.display = "none"; }, 5000);
   }
   document.getElementById("ok").onclick = submit;
-  document.getElementById("cancel").onclick = function () { window.orca.submit({ token: "" }); };
+  document.getElementById("cancel").onclick = function () { orca.submit({ token: "" }); };
+  document.getElementById("btnDetect").onclick = function () { orca.submit({ action: "detect_token" }); };
+  document.getElementById("btnOpenLogs").onclick = function () { orca.submit({ action: "open_logs" }); };
+  window.addEventListener("message", function (ev) {
+    var data = ev.data;
+    if (!data || !data.type) return;
+    if (data.type === "fill_token") {
+      document.getElementById("token").value = data.token;
+      showToast("Token filled from logs.");
+    } else if (data.type === "toast") {
+      showToast(data.message);
+    }
+  });
   document.getElementById("token").focus();
 })();
 </script>
@@ -4045,9 +4125,48 @@ class AnycubicLoginScript(orca.script.ScriptPluginCapabilityBase):
         holder = {}
 
         def on_submit(data):
-            token = ""
-            if isinstance(data, dict):
-                token = (data.get("token") or "").strip()
+            if not isinstance(data, dict):
+                return
+            action = data.get("action")
+            if action == "detect_token":
+                found = _find_anycubic_log_token()
+                if found:
+                    try:
+                        window = holder.get("window")
+                        if window is not None:
+                            window.post_message({"type": "fill_token", "token": found})
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        window = holder.get("window")
+                        if window is not None:
+                            window.post_message({"type": "toast", "message": "No token found in recent logs. Open the log folder and check manually."})
+                    except Exception:
+                        pass
+                return
+            if action == "open_logs":
+                log_dir = _anycubic_log_dir()
+                if log_dir:
+                    try:
+                        import subprocess, sys
+                        if sys.platform == "darwin":
+                            subprocess.Popen(["open", log_dir])
+                        elif sys.platform == "win32":
+                            subprocess.Popen(["explorer", log_dir])
+                        else:
+                            subprocess.Popen(["xdg-open", log_dir])
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        window = holder.get("window")
+                        if window is not None:
+                            window.post_message({"type": "toast", "message": "Could not locate Anycubic Slicer Next log folder."})
+                    except Exception:
+                        pass
+                return
+            token = (data.get("token") or "").strip()
             window = holder.get("window")
             if window is not None:
                 try:
