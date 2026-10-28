@@ -10,7 +10,7 @@ permissions:
 
 env:
   # Space-separated globs matching the plugin files to upload (.whl / .py).
-  PLUGIN_FILES: "my_plugin_any.py"
+  PLUGIN_FILES: "dist/anycubic_cloud_any.py dist/anycubic_cloud_macos_universal.py"
 
 jobs:
   publish:
@@ -18,8 +18,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Optional: build your plugin here so PLUGIN_FILES exist, e.g.
-      # - run: pipx run build --wheel
+      - name: Sync dist artifacts from source
+        run: |
+          cp plugin/plugin.py dist/anycubic_cloud_any.py
+          cp plugin/plugin.py dist/anycubic_cloud_macos_universal.py
+          shasum -a 256 dist/anycubic_cloud_any.py > dist/anycubic_cloud_any.py.sha256
+          shasum -a 256 dist/anycubic_cloud_macos_universal.py > dist/anycubic_cloud_macos_universal.py.sha256
+          ls -la dist/
 
       - name: Publish release to OrcaCloud
         run: |
