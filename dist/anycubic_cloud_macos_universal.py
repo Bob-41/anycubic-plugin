@@ -6,7 +6,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.7.0"
+# version = "0.7.3"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -146,7 +146,7 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.7.0"
+PLUGIN_VERSION = "0.7.3"
 
 # G-code files are read from a local folder. The host grants file-read access
 # per directory tree, so keep the allowed roots to the usual export folders.
@@ -3542,7 +3542,6 @@ LOGIN_DIALOG_HTML = """<!DOCTYPE html>
   </div>
   <textarea id="token" rows="7" spellcheck="false" placeholder="eyJhbGciOiJSUzI1NiIs..."></textarea>
   <div class="hint-row">
-    <button id="btnDetect">Auto-detect from logs</button>
     <button id="btnOpenLogs">Open log folder</button>
   </div>
   <div class="row">
@@ -3566,7 +3565,6 @@ LOGIN_DIALOG_HTML = """<!DOCTYPE html>
   }
   document.getElementById("ok").onclick = submit;
   document.getElementById("cancel").onclick = function () { orca.submit({ token: "" }); };
-  document.getElementById("btnDetect").onclick = function () { orca.submit({ action: "detect_token" }); };
   document.getElementById("btnOpenLogs").onclick = function () { orca.submit({ action: "open_logs" }); };
   window.addEventListener("message", function (ev) {
     var data = ev.data;
@@ -4122,49 +4120,13 @@ class AnycubicLoginScript(orca.script.ScriptPluginCapabilityBase):
             )
             return orca.ExecutionResult.success(message="Already signed in.")
 
+        # Try to auto-detect token from logs BEFORE opening the dialog
+        detected_token = _find_anycubic_log_token()
+
         holder = {}
 
         def on_submit(data):
             if not isinstance(data, dict):
-                return
-            action = data.get("action")
-            if action == "detect_token":
-                found = _find_anycubic_log_token()
-                if found:
-                    try:
-                        window = holder.get("window")
-                        if window is not None:
-                            window.post_message({"type": "fill_token", "token": found})
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        window = holder.get("window")
-                        if window is not None:
-                            window.post_message({"type": "toast", "message": "No token found in recent logs. Open the log folder and check manually."})
-                    except Exception:
-                        pass
-                return
-            if action == "open_logs":
-                log_dir = _anycubic_log_dir()
-                if log_dir:
-                    try:
-                        import subprocess, sys
-                        if sys.platform == "darwin":
-                            subprocess.Popen(["open", log_dir])
-                        elif sys.platform == "win32":
-                            subprocess.Popen(["explorer", log_dir])
-                        else:
-                            subprocess.Popen(["xdg-open", log_dir])
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        window = holder.get("window")
-                        if window is not None:
-                            window.post_message({"type": "toast", "message": "Could not locate Anycubic Slicer Next log folder."})
-                    except Exception:
-                        pass
                 return
             token = (data.get("token") or "").strip()
             window = holder.get("window")
@@ -4177,10 +4139,18 @@ class AnycubicLoginScript(orca.script.ScriptPluginCapabilityBase):
                 login_async(token)
 
         try:
-            # orca.host.ui has no show_dialog(); create_window() is the real API and
-            # it returns immediately, delivering the form through on_submit.
+            # Pass detected token to dialog (pre-fills textarea if found)
+            dialog_html = LOGIN_DIALOG_HTML
+            if detected_token:
+                # Inject the token into the HTML before the script runs
+                inject = 'document.getElementById("token").value = %s; showToast("Token auto-detected from logs.");' % json.dumps(detected_token)
+                dialog_html = dialog_html.replace(
+                    'document.getElementById("token").focus();',
+                    inject + '\n      document.getElementById("token").focus();'
+                )
+
             holder["window"] = ui.create_window(
-                html=LOGIN_DIALOG_HTML,
+                html=dialog_html,
                 title="Anycubic Cloud Login",
                 width=680,
                 height=470,
@@ -4193,7 +4163,8 @@ class AnycubicLoginScript(orca.script.ScriptPluginCapabilityBase):
             )
 
         return orca.ExecutionResult.success(
-            message="Paste your RS256 token in the login window that just opened.")
+            message="Paste your RS256 token in the login window that just opened." + (" (Auto-detected from logs)" if detected_token else ""),
+        )
 
 
 class AnycubicSelectPrinterScript(orca.script.ScriptPluginCapabilityBase):
