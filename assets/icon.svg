@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- Background -->
+  <rect width="128" height="128" rx="16" fill="#009688"/>
+  
+  <!-- Printer silhouette -->
+  <g fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Base -->
+    <path d="M24 92 L104 92"/>
+    <path d="M32 92 L32 56"/>
+    <path d="M96 92 L96 56"/>
+    
+    <!-- Frame -->
+    <path d="M32 56 L32 36 L96 36 L96 56"/>
+    
+    <!-- Gantry -->
+    <path d="M32 36 L96 36"/>
+    <path d="M48 36 L48 24"/>
+    <path d="M80 36 L80 24"/>
+    
+    <!-- Print head -->
+    <path d="M48 24 L80 24"/>
+    <path d="M56 24 L56 16"/>
+    <path d="M72 24 L72 16"/>
+    
+    <!-- Nozzle -->
+    <circle cx="64" cy="16" r="4" fill="white"/>
+  </g>
+  
+  <!-- WiFi signal (cloud connection) -->
+  <g fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" opacity="0.9">
+    <path d="M98 30 Q108 20 118 30"/>
+    <path d="M102 36 Q108 28 114 36"/>
+    <path d="M106 42 Q108 37 110 42"/>
+  </g>
+  
+  <!-- Camera lens (webcam feature) -->
+  <circle cx="30" cy="98" r="8" fill="none" stroke="white" stroke-width="2" opacity="0.8"/>
+  <circle cx="30" cy="98" r="4" fill="white" opacity="0.8"/>
+</svg>
