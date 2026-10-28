@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+*.log
+*.dmg
+dist/__pycache__/
+plugin/__pycache__/
+plugin/tests/__pycache__/
