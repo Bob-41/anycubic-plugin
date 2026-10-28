@@ -10,8 +10,8 @@ permissions:
 
 env:
   # Space-separated globs matching the plugin files to upload (.whl / .py).
-  # Filenames must end with OS/arch target like _macos_arm64, _macos_x86_64, _linux_x86_64, _win_x86_64
-  # Test with just macOS arm64 first
+  # Filenames must end with a supported OS/arch target.
+  # linux_x86_64 is the standard target for pure Python plugins (cross-platform).
   PLUGIN_FILES: "dist/anycubic_linux_x86_64.py"
 
 jobs:
