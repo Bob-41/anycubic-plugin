@@ -4,7 +4,7 @@ Run from the plugin folder:
     PYTHONPATH=tests python3 tests/smoke_test.py
 
 Set ANYCUBIC_PLUGIN_PATH to test a packaged artifact instead:
-    ANYCUBIC_PLUGIN_PATH=../dist/anycubic_linux_x86_64.py \
+    ANYCUBIC_PLUGIN_PATH=../dist/anycubic_cloud_any.py \
         PYTHONPATH=tests python3 tests/smoke_test.py
 """
 
@@ -85,6 +85,12 @@ def main():
     network_http = orca_stub.permissions[0].get("network_http", [])
     assert "https://kinesisvideo.us-east-2.amazonaws.com" in network_http, \
         "KVS control-plane host must be granted for the camera"
+    log_dir = module._anycubic_log_dir()
+    if log_dir:
+        assert log_dir in fs_read, \
+            "Anycubic Slicer Next log dir must be granted for token auto-detect"
+        assert os.path.join(log_dir, "*") in fs_read, \
+            "Anycubic Slicer Next log tree must be granted for token auto-detect"
     print("watch permissions: OK")
 
     # Names must be unique and semicolon-free.

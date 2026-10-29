@@ -1,8 +1,8 @@
 # Anycubic Cloud Plugin for OrcaSlicer
 
-**Version:** 0.8.0  
+**Version:** 0.8.1  
 **Target:** Anycubic Kobra 2 Pro (and other Anycubic printers using the same cloud API)  
-**Format:** Single-file PEP 723 Python plugin (`anycubic_linux_x86_64.py`)
+**Format:** Single-file PEP 723 Python plugin (`anycubic_cloud_any.py`)
 
 ---
 
@@ -33,7 +33,7 @@ This plugin adds a **native dashboard** inside OrcaSlicer for managing Anycubic 
 
 ## Install
 
-1. Download `anycubic_linux_x86_64.py` (and verify `.sha256` if desired)
+1. Download `anycubic_cloud_any.py` (and verify `.sha256` if desired)
 2. In OrcaSlicer: **Preferences → Plugins → Install from file** → select the `.py`
 3. Restart OrcaSlicer
 4. Open the **Anycubic Cloud** page (main window sidebar)
@@ -65,11 +65,11 @@ This plugin adds a **native dashboard** inside OrcaSlicer for managing Anycubic 
 
 ```
 dist/
-├── anycubic_linux_x86_64.py      # ← upload this to Orca Plugin Hub
-└── anycubic_linux_x86_64.py.sha256
+├── anycubic_cloud_any.py      # ← upload this to Orca Plugin Hub
+└── anycubic_cloud_any.py.sha256
 ```
 
-The `_linux_x86_64` suffix is the OrcaCloud target that accepts pure-Python PEP 723 plugins. The plugin declares its dependencies (`paho-mqtt`, `cryptography`) in the header, so it runs on macOS, Linux and Windows wherever OrcaSlicer runs; the filename does not restrict the platform.
+The `_any` suffix is OrcaCloud's universal target. The plugin declares its dependencies (`paho-mqtt`, `cryptography`) in the header and uses only the standard library plus those packages, so the same file runs on macOS, Linux and Windows.
 
 ---
 

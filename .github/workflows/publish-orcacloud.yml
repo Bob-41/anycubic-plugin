@@ -11,8 +11,9 @@ permissions:
 env:
   # Space-separated globs matching the plugin files to upload (.whl / .py).
   # Filenames must end with a supported OS/arch target.
-  # linux_x86_64 is the standard target for pure Python plugins (cross-platform).
-  PLUGIN_FILES: "dist/anycubic_linux_x86_64.py"
+  # "_any" is the universal target: the plugin is pure Python and runs on
+  # macOS, Linux and Windows, so one artifact serves every platform.
+  PLUGIN_FILES: "dist/anycubic_cloud_any.py"
 
 jobs:
   publish:
@@ -22,8 +23,8 @@ jobs:
 
       - name: Sync dist artifacts from source
         run: |
-          cp plugin/plugin.py dist/anycubic_linux_x86_64.py
-          shasum -a 256 dist/anycubic_linux_x86_64.py > dist/anycubic_linux_x86_64.py.sha256
+          cp plugin/plugin.py dist/anycubic_cloud_any.py
+          shasum -a 256 dist/anycubic_cloud_any.py > dist/anycubic_cloud_any.py.sha256
           ls -la dist/
 
       - name: Publish release to OrcaCloud

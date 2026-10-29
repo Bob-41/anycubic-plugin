@@ -76,7 +76,7 @@ G-code from the watched folder → `lockStorageSpace {size, name, is_temp_file:0
 `status/report` is about every 300 s, so the UI must show "last updated N s ago" and mark data stale after about 2× the interval. Do not label F3 "live" in the UI.
 
 ### 3.5.1 Distribution (Orca Plugin Hub)
-- The hub installs one entry file per plugin (`.py` or `.whl`); sibling files are not copied. The upload artifact is `dist/anycubic_linux_x86_64.py`: a single-file PEP 723 plugin with the CA certificate and broker public key embedded as `CA_PEM` / `BROKER_PUB_PEM`.
+- The hub installs one entry file per plugin (`.py` or `.whl`); sibling files are not copied. The upload artifact is `dist/anycubic_cloud_any.py`: a single-file PEP 723 plugin with the CA certificate and broker public key embedded as `CA_PEM` / `BROKER_PUB_PEM`.
 - The `tls/` directory remains an optional local override. If `ca.pem` / `broker_pub.pem` are absent (hub install), the plugin uses the embedded copies for TLS verification and MQTT password encryption.
 - The `_any.py` suffix marks the artifact as universal. Dependencies are declared in the PEP 723 block: `paho-mqtt>=2.0.0`, `cryptography>=41.0.0`.
 - Installed hub copies write their `state.json` next to the installed entry file, same as a side-loaded plugin.

@@ -6,7 +6,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.8.0"
+# version = "0.8.1"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -146,7 +146,7 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.8.0"
+PLUGIN_VERSION = "0.8.1"
 
 # G-code files are read from a local folder. The host grants file-read access
 # per directory tree, so keep the allowed roots to the usual export folders.
@@ -351,18 +351,6 @@ def _anycubic_log_dir():
         if os.path.isdir(d):
             return d
     return None
-    """Accept a raw JWT or a pasted JSON blob containing access_token/id_token."""
-    text = (text or "").strip().strip('"').strip("'")
-    if text.startswith("{"):
-        try:
-            blob = json.loads(text)
-            for key in ("access_token", "id_token", "token"):
-                val = blob.get(key)
-                if isinstance(val, str) and val.count(".") == 2:
-                    return val
-        except Exception:
-            pass
-    return text
 
 
 def _signature(ts: str, nonce: str, version: str = XX_VERSION) -> str:
@@ -4280,8 +4268,15 @@ class AnycubicStopMonitorScript(orca.script.ScriptPluginCapabilityBase):
 @orca.plugin
 class AnycubicCloudPlugin(orca.base):
     def register_capabilities(self):
+        # Token auto-detect reads Anycubic Slicer Next logs, which live outside
+        # the watch folders. Declare them so the host prompts once at load
+        # instead of denying the read silently.
+        log_dir = _anycubic_log_dir()
+        fs_read = list(WATCH_PERMISSIONS)
+        if log_dir:
+            fs_read.extend([log_dir, os.path.join(log_dir, "*")])
         orca.request_permissions(
-            fs_read=WATCH_PERMISSIONS,
+            fs_read=fs_read,
             network_http=[
                 "https://cloud-universe.anycubic.com",
                 "cloud-universe.anycubic.com",
