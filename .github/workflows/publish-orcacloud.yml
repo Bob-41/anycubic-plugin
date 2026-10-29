@@ -3,12 +3,6 @@ name: Publish to OrcaCloud
 on:
   release:
     types: [published]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing release tag to (re)publish, e.g. v0.8.0"
-        required: true
-        type: string
 
 permissions:
   id-token: write
@@ -25,8 +19,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Sync dist artifacts from source
         run: |
@@ -35,18 +27,12 @@ jobs:
           ls -la dist/
 
       - name: Publish release to OrcaCloud
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
           oidc_token="$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=orcacloud" | jq -r .value)"
-          version="${TAG#v}"
+          version="${GITHUB_REF_NAME#v}"
           changelog="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH" | head -c 4000)"
-          if [ -z "$changelog" ]; then
-            changelog="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .body | head -c 4000)"
-          fi
           # Write the JSON to a file: curl -F treats ";" inside a literal value
           # as a form-parameter separator and would truncate the changelog.
           jq -cn --arg version "$version" --arg changelog "$changelog" \
