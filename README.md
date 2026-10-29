@@ -73,6 +73,21 @@ The `_any` suffix is OrcaCloud's universal target. The plugin declares its depen
 
 ---
 
+## Releasing
+
+Every release is built from `master` and published by `.github/workflows/publish-orcacloud.yml`:
+
+```bash
+scripts/release.sh 0.8.2 "## v0.8.2
+- What changed"
+```
+
+The script bumps the PEP 723 header and `PLUGIN_VERSION`, syncs both `dist/` artifacts and checksums, runs the source and packaged smoke tests, pushes, and creates the GitHub Release with `--target master`.
+
+Always tag `master` HEAD. GitHub runs the workflow file from the tagged commit, so tagging an older commit uses that older workflow — the usual cause of a publish that "keeps failing" after a workflow fix.
+
+---
+
 ## Verified live (2026-10-27)
 
 - Upload → start print ✔

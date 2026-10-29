@@ -8,6 +8,11 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  # A re-published release must not race an earlier attempt.
+  group: orcacloud-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   # Space-separated globs matching the plugin files to upload (.whl / .py).
   # Filenames must end with a supported OS/arch target.
@@ -27,12 +32,44 @@ jobs:
           shasum -a 256 dist/anycubic_cloud_any.py > dist/anycubic_cloud_any.py.sha256
           ls -la dist/
 
+      - name: Validate release tag and artifact names
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Release tag '$GITHUB_REF_NAME' is not a semantic version (expected vX.Y.Z)."
+            exit 1
+          fi
+          suffix_re='_(macosx_arm64|macosx_x86_64|macosx_universal|macosx|linux|linux_arm64|linux_x86_64|win_arm64|win_x86_64|win|any)\.(py|whl)$'
+          shopt -s nullglob
+          matched=0
+          for file in $PLUGIN_FILES; do
+            matched=$((matched + 1))
+            if [ ! -s "$file" ]; then
+              echo "::error::Plugin file is missing or empty: $file"
+              exit 1
+            fi
+            if ! printf '%s' "$file" | grep -Eq "$suffix_re"; then
+              echo "::error::$file must end with a supported target suffix, e.g. _any.py, _macosx_universal.py, _linux_x86_64.py or _win_x86_64.py."
+              exit 1
+            fi
+          done
+          if [ "$matched" -eq 0 ]; then
+            echo "::error::No plugin files matched: $PLUGIN_FILES"
+            exit 1
+          fi
+          echo "Publishing version $version: $PLUGIN_FILES"
+
       - name: Publish release to OrcaCloud
         run: |
           set -euo pipefail
-          oidc_token="$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=orcacloud" | jq -r .value)"
           version="${GITHUB_REF_NAME#v}"
+          oidc_token="$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=orcacloud" | jq -r .value)"
+          if [ -z "$oidc_token" ] || [ "$oidc_token" = "null" ]; then
+            echo "::error::Could not obtain a GitHub OIDC token."
+            exit 1
+          fi
           changelog="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH" | head -c 4000)"
           # Write the JSON to a file: curl -F treats ";" inside a literal value
           # as a form-parameter separator and would truncate the changelog.
@@ -45,14 +82,26 @@ jobs:
           for file in $PLUGIN_FILES; do
             args+=(-F "files=@$file")
           done
-          if [ "${#args[@]}" -eq 1 ]; then
-            echo "No plugin files matched: $PLUGIN_FILES" >&2
-            exit 1
-          fi
-          status="$(curl -sS -o response.json -w '%{http_code}' \
-            -H "Authorization: Bearer $oidc_token" \
-            "${args[@]}" \
-            https://api.orcaslicer.com/api/v1/plugin-publish/releases)"
+          status=""
+          for attempt in 1 2 3; do
+            status="$(curl -sS -o response.json -w '%{http_code}' \
+              -H "Authorization: Bearer $oidc_token" \
+              "${args[@]}" \
+              https://api.orcaslicer.com/api/v1/plugin-publish/releases)"
+            if [ "$status" -lt 500 ] || [ "$attempt" -eq 3 ]; then
+              break
+            fi
+            echo "OrcaCloud returned HTTP $status, retrying ($attempt/3)..."
+            sleep $((attempt * 5))
+          done
           cat response.json
           echo
-          [ "$status" = "201" ]
+          if [ "$status" != "201" ] && [ "$status" != "200" ]; then
+            echo "::error::OrcaCloud rejected the release (HTTP $status). See the response above."
+            exit 1
+          fi
+          if ! jq -e --arg v "$version" '.version == $v' response.json >/dev/null; then
+            echo "::error::OrcaCloud accepted the request but did not report version $version."
+            exit 1
+          fi
+          echo "Published $version to OrcaCloud."
