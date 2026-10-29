@@ -6,7 +6,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.7.3"
+# version = "0.8.0"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -146,7 +146,7 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.7.3"
+PLUGIN_VERSION = "0.8.0"
 
 # G-code files are read from a local folder. The host grants file-read access
 # per directory tree, so keep the allowed roots to the usual export folders.
@@ -274,6 +274,22 @@ def _jwt_payload(token: str) -> dict:
         return json.loads(base64.urlsafe_b64decode(part.encode("ascii")))
     except Exception:
         return {}
+
+
+_JWT_TOKEN_RE = None
+
+
+def _extract_access_token(text: str) -> str:
+    """Pull a raw JWT out of pasted text (URL, id_token=..., quotes, whitespace)."""
+    global _JWT_TOKEN_RE
+    value = str(text or "").strip().strip("\"'")
+    if not value:
+        return ""
+    if _JWT_TOKEN_RE is None:
+        import re
+        _JWT_TOKEN_RE = re.compile(r"eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+    match = _JWT_TOKEN_RE.search(value)
+    return match.group(0) if match else value
 
 
 def _jwt_exp(token: str) -> int:
@@ -617,17 +633,27 @@ class PluginState:
         self.recent_messages = []
         self.watch_dir = DEFAULT_WATCH_DIR
         self.upload = None
+        self._state_mtime = 0
         self._load()
 
     # ---- persistence -------------------------------------------------------
+
+    @staticmethod
+    def _state_file_mtime() -> int:
+        try:
+            return os.stat(STATE_PATH).st_mtime_ns
+        except OSError:
+            return 0
 
     def _load(self):
         try:
             with open(STATE_PATH, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
         except Exception:
+            self._state_mtime = self._state_file_mtime()
             return
         if not isinstance(data, dict):
+            self._state_mtime = self._state_file_mtime()
             return
         self.pc_id = data.get("pc_id") or self.pc_id
         self.workbench_token = data.get("workbench_token") or ""
@@ -636,6 +662,16 @@ class PluginState:
         self.printer = data.get("printer") if isinstance(data.get("printer"), dict) else None
         self.failed_token_sha = data.get("failed_token_sha") or ""
         self.watch_dir = data.get("watch_dir") or DEFAULT_WATCH_DIR
+        self._state_mtime = self._state_file_mtime()
+
+    def reload_if_changed(self) -> bool:
+        """Pick up a state.json rewritten by another process (CLI sign-in, reinstall)."""
+        mtime = self._state_file_mtime()
+        with self.lock:
+            if mtime == self._state_mtime:
+                return False
+            self._load()
+        return True
 
     def save(self):
         with self.lock:
@@ -653,6 +689,7 @@ class PluginState:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, indent=2)
             os.replace(tmp, STATE_PATH)
+            self._state_mtime = self._state_file_mtime()
         except Exception:
             try:
                 os.remove(tmp)
@@ -4004,6 +4041,12 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
 
     def _sync_config_token(self):
         """Keep the Config tab in step with the cached session, and exchange a token if signed out."""
+        # Another process (or a fresh sign-in) may have rewritten state.json.
+        try:
+            if STATE.reload_if_changed():
+                self._config_synced = False
+        except Exception:
+            pass
         try:
             config = json.loads(self.get_config() or "{}")
         except Exception:

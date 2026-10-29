@@ -4,7 +4,7 @@ Run from the plugin folder:
     PYTHONPATH=tests python3 tests/smoke_test.py
 
 Set ANYCUBIC_PLUGIN_PATH to test a packaged artifact instead:
-    ANYCUBIC_PLUGIN_PATH=../dist/anycubic_cloud_any.py \
+    ANYCUBIC_PLUGIN_PATH=../dist/anycubic_linux_x86_64.py \
         PYTHONPATH=tests python3 tests/smoke_test.py
 """
 
@@ -977,6 +977,64 @@ def main():
     assert module.KVS_STUN_SERVERS
     assert module.KVS_STUN_SERVERS[0]["urls"].startswith("stun:")
     print("dashboard camera wiring: OK")
+
+    # JWT extraction accepts raw tokens, URLs and id_token=... fragments.
+    jwt = ("eyJhbGciOiJSUzI1NiJ9."
+           "eyJlbWFpbCI6ImFAYi5jIn0."
+           "c2lnbmF0dXJl")
+    assert module._extract_access_token(jwt) == jwt
+    assert module._extract_access_token("id_token=" + jwt) == jwt
+    assert module._extract_access_token(
+        '"https://login.example/cb?access_token=%s&state=1"' % jwt) == jwt
+    assert module._extract_access_token("  %s\n" % jwt) == jwt
+    assert module._extract_access_token("not a token") == "not a token"
+    print("token extraction: OK")
+
+    # login_with_rs256 must not raise NameError; exchange is faked.
+    saved_http = module._http_json
+    saved_auth = (module.STATE.workbench_token, module.STATE.token_exp, module.STATE.email)
+
+    def fake_login_http(method, path, body):
+        assert path == module.LOGIN_PATH, path
+        assert body.get("access_token") == jwt, body
+        return {"code": 1, "data": {
+            "token": "workbench-token",
+            "user": {"user_email": "detected@example.com"},
+        }}
+
+    module._http_json = fake_login_http
+    try:
+        ok, message = module.login_with_rs256("id_token=" + jwt)
+        assert ok, message
+        assert module.STATE.workbench_token == "workbench-token"
+        assert module.STATE.email == "detected@example.com"
+        assert module.STATE.is_logged_in()
+    finally:
+        module._http_json = saved_http
+        (module.STATE.workbench_token,
+         module.STATE.token_exp,
+         module.STATE.email) = saved_auth
+        module.STATE.save()
+    print("login exchange: OK")
+
+    # state.json rewritten by another process is picked up without a restart.
+    module.STATE.workbench_token = ""
+    module.STATE.email = ""
+    module.STATE.save()
+    assert not module.STATE.is_logged_in()
+    with open(module.STATE_PATH, "r", encoding="utf-8") as fh:
+        disk_state = json.load(fh)
+    disk_state["workbench_token"] = "external-token"
+    disk_state["email"] = "external@example.com"
+    disk_state["token_exp"] = int(time.time()) + 3600
+    with open(module.STATE_PATH, "w", encoding="utf-8") as fh:
+        json.dump(disk_state, fh)
+    assert module.STATE.reload_if_changed() is True
+    assert module.STATE.workbench_token == "external-token"
+    assert module.STATE.email == "external@example.com"
+    assert module.STATE.is_logged_in()
+    assert module.STATE.reload_if_changed() is False
+    print("external state reload: OK")
 
     # The login script must open a host window, not call the non-existent show_dialog().
     login = instances[1]
