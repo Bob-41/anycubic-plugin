@@ -1,6 +1,6 @@
 # Anycubic Cloud Plugin for OrcaSlicer
 
-**Version:** 0.8.2
+**Version:** 0.8.3
 **Target:** Anycubic Kobra 2 Pro (and other Anycubic printers using the same cloud API)  
 **Format:** Single-file PEP 723 Python plugin (`anycubic_cloud_any.py`)
 

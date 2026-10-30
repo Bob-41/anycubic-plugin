@@ -6,7 +6,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.8.2"
+# version = "0.8.3"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -26,10 +26,11 @@ Provides:
     starts the print with order 1 on the selected printer. Folder scanning runs
     on a background watcher; the dashboard only reads its cached snapshot.
   * A "Camera" panel on the dashboard: opens the printer's cloud camera with
-    order 1001, asks the printer to start pushing video over MQTT, and plays the
-    AWS Kinesis Video Streams WebRTC feed in the dashboard. Stop closes the
-    stream with MQTT stopCapture and order 1002. The camera is monitoring-only;
-    it never touches an active print.
+    order 1001 and plays its WebRTC feed. Newer firmware publishes through
+    Agora ("shengwang"), older firmware through AWS Kinesis Video Streams; both
+    are handled. Stop closes the stream with MQTT stopCapture (KVS only) and
+    order 1002. The camera is monitoring-only; it never touches an active
+    print.
 
 Protocol details (verified):
   HTTP  : XX-Signature = MD5(KEY_A + ts + XX-Version + KEY_B + nonce + KEY_A)
@@ -41,17 +42,18 @@ Protocol details (verified):
   Upload: lockStorageSpace -> PUT preSignUrl -> profile/newUploadFile -> unlock
   Print : POST /work/operation/sendOrder {order_id:1, ...}
   Control: POST /work/operation/sendOrder {order_id:2|3|4, printer_id, project_id, ...}
-  Camera : POST /work/operation/sendOrder {order_id:1001} -> temporary AWS STS
-           credentials; MQTT video/startCapture -> KVS WebRTC master; viewer
-           gets a SigV4-presigned WSS URL and plays H.264 in the dashboard.
+  Camera : POST /work/operation/sendOrder {order_id:"1001", printer_id,
+           shengwang_rtc_support:true} -> data.shengwang (Agora) or data.token
+           (legacy AWS STS). Agora needs no MQTT command; KVS needs
+           MQTT video/startCapture and plays a SigV4-presigned WSS URL.
            POST /work/operation/sendOrder {order_id:1002} closes the session.
 
 Control commands are limited to the explicitly confirmed "Upload + start print"
 and the confirmed Pause/Resume/Stop buttons on the dashboard. Every command is
 re-checked against the cloud's active project immediately before it is sent,
 so a stale dashboard cannot act on a job that has already finished. The camera
-is strictly a viewer: its only printer-side messages are startCapture and
-stopCapture.
+is strictly a viewer: its only printer-side messages are the legacy KVS
+startCapture and stopCapture.
 """
 
 import base64
@@ -59,6 +61,7 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import ssl
 import threading
 import time
@@ -146,7 +149,7 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.8.2"
+PLUGIN_VERSION = "0.8.3"
 
 # G-code files are read from a local folder. The host grants file-read access
 # per directory tree, so keep the allowed roots to the usual export folders.
@@ -200,11 +203,12 @@ CONTROL_VERBS = {"pause": "Pause", "resume": "Resume", "stop": "Stop"}
 # few seconds keeps the controls accurate without hammering the cloud.
 PROJECT_REFRESH_INTERVAL = 5.0
 
-# --- Camera (verified 2026-10-27) -------------------------------------------
-# Order 1001 returns temporary AWS STS credentials in data.token. The printer
-# then publishes its WebRTC master on the KVS channel named after the printer
-# key; a viewer signs a WSS URL for that channel and exchanges SDP/ICE with it.
-# The printer only starts sending media after MQTT video/startCapture.
+# --- Camera (verified 2026-10-27, Agora 2026-10-30) -------------------------
+# Order 1001 returns either data.shengwang (Agora, newer firmware) or
+# data.token (temporary AWS STS credentials for KVS, older firmware). On KVS
+# the printer publishes on the channel named after the printer key and only
+# starts sending media after MQTT video/startCapture. On Agora the order
+# itself makes the printer join and publish; no MQTT command is involved.
 CAMERA_OPEN_ORDER = 1001
 CAMERA_CLOSE_ORDER = 1002
 KVS_SERVICE = "kinesisvideo"
@@ -242,6 +246,61 @@ for _kvs_region in KVS_REGIONS:
     KVS_SOCKET_PERMISSIONS.extend([
         "('%s', 443)" % _kvs_host,
         _kvs_host + ":443",
+    ])
+
+
+# --- Agora ("shengwang") camera ---------------------------------------------
+# Newer Anycubic printers publish their camera over Agora SD-RTN instead of
+# AWS Kinesis Video Streams. The camera order itself is unchanged, but the
+# cloud only returns the Agora block when the request advertises
+# shengwang_rtc_support. Without that flag it answers "Video service upgraded.
+# Update the slicer to enable." even for printers that still use KVS.
+#
+# The signaling protocol below is Agora's Web SDK wire format (v4.24.0), as
+# reconstructed by the hass-anycubic project. The browser stays the WebRTC
+# peer: Python only performs the HTTP/WebSocket signaling handshake and builds
+# the SDP answer. The edge websocket is opened by the dashboard, because Orca's
+# plugin sandbox cannot grant the dynamic *.edge.agora.io host.
+AGORA_AP_PATH = "/api/v2/transpond/webrtc?v=2"
+AGORA_AP_DOMAINS = (
+    "webrtc2-ap-web-1.agora.io",
+    "webrtc2-2.ap.sd-rtn.com",
+)
+AGORA_AP_BACKUPS = (
+    "webrtc2-ap-web-3.agora.io",
+    "webrtc2-4.ap.sd-rtn.com",
+)
+AGORA_AP_TIMEOUT = 7.0
+AGORA_JOIN_TIMEOUT = 20.0
+AGORA_STREAM_ANNOUNCE_TIMEOUT = 10.0
+AGORA_PING_INTERVAL = 3.0
+AGORA_SDK_VERSION = "4.24.0"
+AGORA_CHANNEL_MODE = "live"
+AGORA_CHANNEL_CODEC = "h264"
+AGORA_ROLE = "host"
+AGORA_BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+)
+# Agora's 1024-bit channel-key wrapping key, from agora-rtc-sdk-ng 4.24.0.
+AGORA_PUBLIC_KEY_B64 = (
+    "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDCMnXAHkKIGAM+x4N22gCI+Wyu"
+    "STM9ztkT3uYslTT2PuKmZfPzhH6kVdO7PTjGCOZnAsyb3oTtWat0KcxQ4jxvqQV+"
+    "HvYl3iI1Yd4vl2c3qRMJPLtRDfNxa2Mcxgq7e9aEUibzdd0st+OJAy3tOj/Y0aVy"
+    "xQiYDz3vqa6bP29adwIDAQAB"
+)
+AGORA_AP_HTTP_PERMISSIONS = []
+AGORA_AP_SOCKET_PERMISSIONS = []
+for _agora_host in AGORA_AP_DOMAINS + AGORA_AP_BACKUPS:
+    AGORA_AP_HTTP_PERMISSIONS.extend([
+        "https://" + _agora_host,
+        _agora_host,
+        _agora_host + ":443",
+        "('%s', 443)" % _agora_host,
+    ])
+    AGORA_AP_SOCKET_PERMISSIONS.extend([
+        "('%s', 443)" % _agora_host,
+        _agora_host + ":443",
     ])
 
 
@@ -588,9 +647,1115 @@ def _kvs_wss_endpoint(channel_arn, creds):
     raise RuntimeError("AWS did not return a WSS signaling endpoint.")
 
 
-# ============================================================================
-# Module state (shared by all capabilities)
-# ============================================================================
+# ----------------------------------------------------------------------------
+# Agora (shengwang) signaling
+# ----------------------------------------------------------------------------
+# The cloud camera handshake has three hops:
+#   1. POST /work/operation/sendOrder {order_id:"1001", shengwang_rtc_support}
+#      returns data.shengwang (appid, channel, rtc_token, client_uid, ...).
+#   2. POST Agora's access point to turn that channel into an edge address.
+#   3. The dashboard opens a websocket to the edge and relays the Agora
+#      join/answer frames; Python builds the ORTC join and the SDP answer.
+# The browser is the WebRTC peer, so the AES channel key is wrapped for the
+# edge (RSA-OAEP/SHA-256) and the media arrives as ordinary DTLS-SRTP.
+
+class AgoraCredentials:
+    """One camera session's short-lived Agora join credentials."""
+
+    def __init__(self, appid, channel, rtc_token, client_uid,
+                 device_uid=None, encryption_key="", encryption_mode="",
+                 encryption_kdf_salt="", event_id="", msgid="",
+                 printer_id=0):
+        self.appid = str(appid or "")
+        self.channel = str(channel or "")
+        self.rtc_token = str(rtc_token or "")
+        self.client_uid = int(client_uid or 0)
+        self.device_uid = int(device_uid) if device_uid is not None else None
+        self.encryption_key = str(encryption_key or "")
+        self.encryption_mode = str(encryption_mode or "")
+        self.encryption_kdf_salt = str(encryption_kdf_salt or "")
+        self.event_id = str(event_id or "")
+        self.msgid = str(msgid or "")
+        self.printer_id = int(printer_id or 0)
+
+    @property
+    def web_encryption_mode(self):
+        return self.encryption_mode.lower().replace("_", "-")
+
+    @property
+    def is_encrypted(self):
+        return bool(
+            self.encryption_mode
+            and self.encryption_mode.lower() != "none"
+            and self.encryption_key
+        )
+
+    def __repr__(self):
+        return (
+            "AgoraCredentials(appid=%s, channel=%s, uid=%s, mode=%s)"
+            % (self.appid, self.channel, self.client_uid,
+               self.encryption_mode or "none")
+        )
+
+
+def _agora_credentials(order_data, printer_id=0):
+    """Parse the order-1001 data block into AgoraCredentials, or None."""
+    data = order_data if isinstance(order_data, dict) else {}
+    block = data.get("shengwang")
+    if not isinstance(block, dict) or not block:
+        return None
+    appid = block.get("appid") or ""
+    channel = block.get("channel") or ""
+    token = block.get("rtc_token") or ""
+    uid = _as_int(block.get("client_uid") or block.get("uid"))
+    if not appid or not channel or not token or not uid:
+        raise RuntimeError(
+            "The camera response did not include usable Agora credentials.")
+    device = data.get("shengwang_device")
+    if not isinstance(device, dict):
+        device = {}
+    return AgoraCredentials(
+        appid=appid,
+        channel=channel,
+        rtc_token=token,
+        client_uid=uid,
+        device_uid=device.get("uid", block.get("uid")),
+        encryption_key=block.get("encryption_key") or "",
+        encryption_mode=block.get("encryption_mode") or "",
+        encryption_kdf_salt=block.get("encryption_kdf_salt") or "",
+        event_id=block.get("event_id") or "",
+        msgid=data.get("msgid") or "",
+        printer_id=printer_id,
+    )
+
+
+def _agora_ap_post(host, body):
+    """POST one choose-server request to an Agora access point."""
+    from urllib import request as urlrequest
+
+    boundary = "----anycubic" + uuid.uuid4().hex
+    blob = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    data = (
+        ("--%s\r\nContent-Disposition: form-data; name=\"request\"\r\n"
+         "Content-Type: application/json\r\n\r\n") % boundary
+    ).encode("utf-8") + blob + ("\r\n--%s--\r\n" % boundary).encode("utf-8")
+    req = urlrequest.Request(
+        "https://%s%s" % (host, AGORA_AP_PATH),
+        data=data,
+        headers={
+            "Accept": "*/*",
+            "Content-Type": "multipart/form-data; boundary=%s" % boundary,
+        },
+        method="POST",
+    )
+    with urlrequest.urlopen(req, timeout=AGORA_AP_TIMEOUT) as response:
+        raw = response.read().decode("utf-8", "replace")
+    return json.loads(raw)
+
+
+def _agora_parse_ap(payload):
+    """Turn an access-point response into the block the join echoes back."""
+    bodies = payload.get("response_body") or []
+    if not bodies:
+        raise RuntimeError("Agora's access point returned no response body.")
+    base_detail = payload.get("detail") or {}
+    blocks = {}
+    rejected = []
+    for item in bodies:
+        buffer = item.get("buffer") or {}
+        try:
+            code = int(buffer.get("code", -1))
+        except Exception:
+            code = -1
+        if code != 0:
+            # The rejected buffer's detail echoes the credential, so never
+            # put it in an error the dashboard or a log can show.
+            rejected.append(str(code))
+            continue
+
+        detail = dict(base_detail)
+        detail.update(buffer.get("detail") or {})
+        fingerprints = [
+            value.strip()
+            for value in str(detail.get("19", "")).split(";")
+            if value.strip()
+        ]
+        addresses = []
+        for index, edge in enumerate(buffer.get("edges_services") or []):
+            ip = edge.get("ip")
+            port = edge.get("port")
+            if not ip or not port:
+                continue
+            try:
+                port = int(port)
+            except Exception:
+                continue
+            addresses.append({
+                "ip": str(ip),
+                "port": port,
+                "ticket": str(buffer.get("cert") or ""),
+                "fingerprint": (
+                    fingerprints[index] if index < len(fingerprints) else ""),
+            })
+        try:
+            flag = int(buffer.get("flag", 0))
+        except Exception:
+            flag = 0
+        blocks[flag] = {
+            "code": code,
+            "uid": _as_int(buffer.get("uid")),
+            "cid": _as_int(buffer.get("cid")),
+            "cname": str(buffer.get("cname") or ""),
+            "ticket": str(buffer.get("cert") or ""),
+            "flag": flag,
+            "opid": _as_int(payload.get("opid")),
+            "server_ts": _as_int(
+                payload.get("enter_ts") or int(_now() * 1000)),
+            "detail": detail,
+            "addresses": addresses,
+        }
+    if not blocks:
+        raise RuntimeError(
+            "Agora rejected the camera token (%s)."
+            % (", ".join(rejected[:2]) or "no service block"))
+    chosen = blocks.get(4096) or next(iter(blocks.values()))
+    if not chosen["addresses"]:
+        raise RuntimeError("Agora returned no camera edge address.")
+    return chosen
+
+
+def _agora_choose_server(credentials):
+    """Ask Agora which SD-RTN edge serves this channel."""
+    body = {
+        "appid": credentials.appid,
+        "client_ts": int(_now() * 1000),
+        "opid": uuid.uuid4().int % 1000000000000,
+        "sid": uuid.uuid4().hex.upper(),
+        "request_bodies": [{
+            "uri": 22,
+            "buffer": {
+                "cname": credentials.channel,
+                "detail": {"11": "CN,GLOBAL", "17": "1", "22": "CN,GLOBAL"},
+                "key": credentials.rtc_token,
+                "service_ids": [11, 26],
+                "uid": credentials.client_uid,
+            },
+        }],
+    }
+    errors = []
+    for host in AGORA_AP_DOMAINS + AGORA_AP_BACKUPS:
+        try:
+            return _agora_parse_ap(_agora_ap_post(host, body))
+        except Exception as exc:
+            errors.append("%s: %s" % (host, exc))
+    raise RuntimeError(
+        "Could not reach Agora's camera service: " + "; ".join(errors))
+
+
+def _agora_id():
+    return uuid.uuid4().hex[:6]
+
+
+def _agora_wrap_key(encryption_key):
+    """RSA-OAEP/SHA-256 wrap the raw channel string for the join message."""
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    if not encryption_key:
+        raise RuntimeError("Agora's channel is encrypted but no key was sent.")
+    try:
+        public_key = serialization.load_der_public_key(
+            base64.b64decode(AGORA_PUBLIC_KEY_B64))
+    except Exception as exc:
+        raise RuntimeError("Could not load Agora's channel key: %s" % exc)
+    plaintext = encryption_key.encode("utf-8")
+    # A 1024-bit key leaves 62 bytes after OAEP/SHA-256 overhead; a valid
+    # Anycubic key is 32 ASCII characters.
+    if len(plaintext) > 62:
+        raise RuntimeError("The Agora channel key is too long to wrap.")
+    wrapped = public_key.encrypt(
+        plaintext,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+    return base64.b64encode(wrapped).decode("ascii")
+
+
+def _agora_validate_salt(salt):
+    """Agora's KDF salt is base64 for exactly 32 bytes; pass it through."""
+    try:
+        raw = base64.b64decode(salt, validate=True)
+    except Exception:
+        raise RuntimeError("Agora's channel salt is not valid base64.")
+    if len(raw) != 32:
+        raise RuntimeError("Agora's channel salt has the wrong length.")
+    return salt
+
+
+# --- SDP <-> ORTC -----------------------------------------------------------
+# Agora's join message carries an ORTC object, not SDP. These helpers are a
+# dependency-free port of the parser used by hass-anycubic (MIT), itself based
+# on the Agora Web SDK. The browser's offer and the gateway's answer are the
+# only two SDP documents involved.
+
+_SDP_DIRECTIONS = frozenset(
+    {"sendrecv", "sendonly", "recvonly", "inactive"})
+_SDP_SCALARS = {
+    "ice-ufrag": "iceUfrag",
+    "ice-pwd": "icePwd",
+    "ice-options": "iceOptions",
+    "setup": "setup",
+    "mid": "mid",
+}
+
+
+def _sdp_parse(sdp):
+    session = {"media": []}
+    scope = session
+    for raw_line in str(sdp or "").splitlines():
+        line = raw_line.strip()
+        if len(line) < 2 or line[1] != "=":
+            continue
+        kind, value = line[0], line[2:]
+        if kind == "m":
+            scope = _sdp_new_media(session, value)
+        elif kind == "a":
+            _sdp_parse_attribute(scope, session, value)
+        elif kind == "v":
+            session["version"] = value
+        elif kind == "s":
+            session["name"] = value
+        elif kind == "o":
+            parts = value.split()
+            if len(parts) >= 6:
+                session["origin"] = {
+                    "username": parts[0], "sessionId": parts[1],
+                    "sessionVersion": parts[2], "netType": parts[3],
+                    "ipVer": parts[4], "address": parts[5],
+                }
+    return session
+
+
+def _sdp_new_media(session, value):
+    parts = value.split()
+    if len(parts) < 3:
+        raise RuntimeError("The camera offer has a malformed media line.")
+    try:
+        port = int(parts[1])
+    except ValueError:
+        raise RuntimeError("The camera offer has a malformed media port.")
+    media = {
+        "type": parts[0], "port": port, "protocol": parts[2],
+        "payloads": " ".join(parts[3:]), "rtp": [], "fmtp": [],
+        "rtcpFb": [], "ext": [], "fingerprints": [],
+    }
+    session["media"].append(media)
+    return media
+
+
+def _sdp_parse_attribute(scope, session, value):
+    name, sep, rest = value.partition(":")
+    payload = rest if sep else None
+    if name in _SDP_DIRECTIONS:
+        scope["direction"] = name
+        return
+    if name == "extmap-allow-mixed":
+        session["extmapAllowMixed"] = True
+        return
+    if name == "rtcp-mux":
+        scope["rtcpMux"] = True
+        return
+    if name in _SDP_SCALARS and payload is not None:
+        scope[_SDP_SCALARS[name]] = payload
+        return
+    if payload is None:
+        return
+    if name == "fingerprint":
+        parts = payload.split()
+        if len(parts) >= 2:
+            entry = {"hash": parts[0], "fingerprint": parts[1]}
+            scope.setdefault("fingerprints", []).append(entry)
+            scope["fingerprint"] = entry
+    elif name == "rtpmap":
+        parts = payload.split(None, 1)
+        if len(parts) < 2:
+            return
+        try:
+            payload_type = int(parts[0])
+        except ValueError:
+            return
+        fields = parts[1].split("/")
+        scope.setdefault("rtp", []).append({
+            "payload": payload_type,
+            "codec": fields[0],
+            "rate": (int(fields[1])
+                     if len(fields) > 1 and fields[1].isdigit() else 90000),
+            "encoding": fields[2] if len(fields) > 2 else None,
+        })
+    elif name == "fmtp":
+        parts = payload.split(None, 1)
+        if not parts:
+            return
+        try:
+            payload_type = int(parts[0])
+        except ValueError:
+            return
+        scope.setdefault("fmtp", []).append({
+            "payload": payload_type,
+            "config": parts[1] if len(parts) > 1 else "",
+        })
+    elif name == "rtcp-fb":
+        parts = payload.split()
+        if len(parts) < 2:
+            return
+        if parts[0] == "*":
+            payload_type = "*"
+        else:
+            try:
+                payload_type = int(parts[0])
+            except ValueError:
+                return
+        scope.setdefault("rtcpFb", []).append({
+            "payload": payload_type,
+            "type": parts[1],
+            "subtype": " ".join(parts[2:]) if len(parts) > 2 else None,
+        })
+    elif name == "extmap":
+        parts = payload.split()
+        if len(parts) < 2:
+            return
+        try:
+            entry = int(parts[0].split("/", 1)[0])
+        except ValueError:
+            return
+        scope.setdefault("ext", []).append({
+            "value": entry, "uri": parts[1]})
+    elif name == "candidate":
+        parts = payload.removeprefix("candidate:").split()
+        if len(parts) < 8 or parts[6] != "typ":
+            return
+        try:
+            candidate = {
+                "foundation": parts[0],
+                "protocol": parts[2],
+                "priority": int(parts[3]),
+                "ip": parts[4],
+                "port": int(parts[5]),
+                "type": parts[7],
+            }
+        except (TypeError, ValueError):
+            return
+        scope.setdefault("candidates", []).append(candidate)
+    elif name == "group":
+        parts = payload.split()
+        if parts:
+            session.setdefault("groups", []).append({
+                "type": parts[0], "mids": " ".join(parts[1:])})
+    elif name == "msid-semantic":
+        parts = payload.split()
+        if parts:
+            session["msidSemantic"] = {
+                "semantic": parts[0],
+                "token": parts[1] if len(parts) > 1 else "",
+            }
+
+
+def _sdp_capabilities():
+    return {
+        "audioCodecs": [], "audioExtensions": [],
+        "videoCodecs": [], "videoExtensions": [],
+    }
+
+
+def _sdp_codec(rtp, media):
+    payload_type = rtp["payload"]
+    feedbacks = [
+        {"type": item["type"], "parameter": item["subtype"]}
+        for item in media.get("rtcpFb", [])
+        if item["payload"] in (payload_type, "*")
+    ]
+    parameters = {}
+    for item in media.get("fmtp", []):
+        if item["payload"] != payload_type:
+            continue
+        for part in str(item.get("config", "")).split(";"):
+            key, sep, value = part.partition("=")
+            if sep:
+                parameters[key.strip()] = value.strip()
+    return {
+        "payloadType": payload_type,
+        "rtpMap": {
+            "encodingName": rtp["codec"],
+            "clockRate": rtp["rate"],
+            "encodingParameters": rtp["encoding"],
+        },
+        "rtcpFeedbacks": feedbacks,
+        "fmtp": {"parameters": parameters},
+    }
+
+
+def _sdp_transport(session):
+    ice = {}
+    dtls = {}
+    candidates = []
+    for scope in list(session.get("media", [])) + [session]:
+        if not ice and scope.get("iceUfrag"):
+            ice = {
+                "iceUfrag": scope.get("iceUfrag"),
+                "icePwd": scope.get("icePwd"),
+            }
+        if not dtls and scope.get("fingerprints"):
+            dtls = {
+                "fingerprints": [
+                    {"hashFunction": item["hash"],
+                     "fingerprint": item["fingerprint"]}
+                    for item in scope["fingerprints"]
+                ],
+            }
+        for candidate in scope.get("candidates", []):
+            if candidate not in candidates:
+                candidates.append(candidate)
+    if candidates:
+        ice["candidates"] = candidates
+    dtls["role"] = "client"
+    return ice, dtls
+
+
+def _sdp_offer_to_ortc(session):
+    ice, dtls = _sdp_transport(session)
+    if not ice.get("iceUfrag") or not ice.get("icePwd"):
+        raise RuntimeError("The camera offer carries no ICE credentials.")
+    if not dtls.get("fingerprints"):
+        raise RuntimeError("The camera offer carries no DTLS fingerprint.")
+    send = _sdp_capabilities()
+    recv = _sdp_capabilities()
+    for media in session.get("media", []):
+        media_type = media.get("type")
+        if media_type not in ("audio", "video"):
+            continue
+        codecs = [_sdp_codec(rtp, media) for rtp in media.get("rtp", [])]
+        extensions = [
+            {"entry": item["value"], "extensionName": item["uri"]}
+            for item in media.get("ext", [])
+        ]
+        direction = media.get("direction", "sendrecv")
+        if direction == "sendonly":
+            targets = [send]
+        elif direction == "recvonly":
+            targets = [recv]
+        elif direction == "inactive":
+            targets = []
+        else:
+            targets = [send, recv]
+        for target in targets:
+            target["%sCodecs" % media_type].extend(codecs)
+            target["%sExtensions" % media_type].extend(extensions)
+    return {
+        "iceParameters": ice,
+        "dtlsParameters": dtls,
+        "rtpCapabilities": {"send": send, "recv": recv},
+        "version": "2",
+    }
+
+
+def _sdp_parse_offer(offer_sdp):
+    session = _sdp_parse(offer_sdp)
+    media_sections = session.get("media", [])
+    if not media_sections:
+        raise RuntimeError("The camera offer contains no media sections.")
+    ice, _ = _sdp_transport(session)
+    audio_extensions = []
+    video_extensions = []
+    for media in media_sections:
+        if media.get("type") == "video":
+            target = video_extensions
+        elif media.get("type") == "audio":
+            target = audio_extensions
+        else:
+            continue
+        target.extend(
+            {"entry": item["value"], "extensionName": item["uri"]}
+            for item in media.get("ext", [])
+        )
+    bundle_mids = " ".join(
+        str(item.get("mid", index))
+        for index, item in enumerate(media_sections))
+    for group in session.get("groups", []):
+        if group.get("type") == "BUNDLE":
+            bundle_mids = group["mids"]
+            break
+    return {
+        "parsed": session,
+        "media": media_sections,
+        "ice_ufrag": ice.get("iceUfrag") or "",
+        "ice_pwd": ice.get("icePwd") or "",
+        "bundle_mids": bundle_mids,
+        "extmap_allow_mixed": bool(session.get("extmapAllowMixed")),
+        "audio_extensions": audio_extensions,
+        "video_extensions": video_extensions,
+    }
+
+
+def _sdp_select_capabilities(ortc):
+    capabilities = ortc.get("rtpCapabilities") or {}
+    for key in ("sendrecv", "recv", "send"):
+        block = capabilities.get(key)
+        if block:
+            return block
+    return capabilities
+
+
+def _sdp_fingerprint_line(dtls):
+    for item in dtls.get("fingerprints", []):
+        value = item.get("fingerprint")
+        if value:
+            algorithm = (
+                item.get("hashFunction") or item.get("algorithm") or "sha-256")
+            return "%s %s" % (algorithm, value)
+    raise RuntimeError("Agora's answer carries no DTLS fingerprint.")
+
+
+def _sdp_candidate_lines(candidates):
+    lines = []
+    for index, item in enumerate(candidates or []):
+        address = item.get("ip") or item.get("address")
+        port = item.get("port")
+        if not address or not port:
+            continue
+        lines.append(
+            "a=candidate:%s 1 %s %s %s %s typ %s" % (
+                item.get("foundation", "agora%s" % index),
+                item.get("protocol", "udp"),
+                item.get("priority", 2103266323),
+                address, port, item.get("type", "host"),
+            )
+        )
+    return lines
+
+
+def _sdp_answer_direction(offered):
+    return {
+        "sendonly": "recvonly",
+        "recvonly": "sendonly",
+        "sendrecv": "sendrecv",
+    }.get(offered, "inactive")
+
+
+def _sdp_codec_lines(codecs):
+    lines = []
+    for codec in codecs:
+        payload_type = codec.get("payloadType")
+        rtp_map = codec.get("rtpMap") or {}
+        name = rtp_map.get("encodingName", "")
+        clock_rate = rtp_map.get("clockRate", 90000)
+        encoding = rtp_map.get("encodingParameters")
+        suffix = "/%s" % encoding if encoding else ""
+        lines.append(
+            "a=rtpmap:%s %s/%s%s" % (
+                payload_type, name, clock_rate, suffix))
+        for feedback in codec.get("rtcpFeedbacks", []):
+            parameter = feedback.get("parameter")
+            tail = " %s" % parameter if parameter else ""
+            lines.append(
+                "a=rtcp-fb:%s %s%s" % (
+                    payload_type, feedback.get("type"), tail))
+        parameters = (codec.get("fmtp") or {}).get("parameters") or {}
+        if parameters:
+            config = ";".join(
+                "%s=%s" % (key, value) for key, value in parameters.items())
+            lines.append("a=fmtp:%s %s" % (payload_type, config))
+    return lines
+
+
+def _sdp_extension_lines(offered, accepted):
+    offered_ids = {
+        item.get("extensionName"): item.get("entry") for item in offered}
+    return [
+        "a=extmap:%s %s" % (offered_ids[name], name)
+        for item in accepted
+        if (name := item.get("extensionName")) in offered_ids
+    ]
+
+
+def _sdp_ssrc_lines(stream):
+    if not stream:
+        return []
+    cname = stream.get("cname") or "agora"
+    ssrc = stream.get("ssrc")
+    rtx_ssrc = stream.get("rtx_ssrc")
+    lines = [
+        "a=msid:agora agora-video",
+        "a=ssrc:%s cname:%s" % (ssrc, cname),
+        "a=ssrc:%s msid:agora agora-video" % ssrc,
+        "a=ssrc:%s mslabel:agora" % ssrc,
+        "a=ssrc:%s label:agora-video" % ssrc,
+    ]
+    if rtx_ssrc is not None:
+        lines.append("a=ssrc-group:FID %s %s" % (ssrc, rtx_ssrc))
+        lines.append("a=ssrc:%s cname:%s" % (rtx_ssrc, cname))
+    return lines
+
+
+def _sdp_media_answer(media, index, capabilities, offer_info,
+                      ice_ufrag, ice_pwd, fingerprint, candidates, stream):
+    media_type = str(media.get("type", "video"))
+    codecs = capabilities.get("%sCodecs" % media_type) or []
+    accepted_extensions = (
+        capabilities.get("%sExtensions" % media_type) or [])
+    offered_extensions = (
+        offer_info["audio_extensions"] if media_type == "audio"
+        else offer_info["video_extensions"])
+    direction = _sdp_answer_direction(
+        str(media.get("direction", "sendrecv")))
+    payload_types = [str(item.get("payloadType")) for item in codecs]
+    if not payload_types:
+        payload_types = str(media.get("payloads", "")).split()
+        direction = "inactive"
+    mid = str(media.get("mid", index))
+    lines = [
+        "m=%s 9 UDP/TLS/RTP/SAVPF %s" % (
+            media_type, " ".join(payload_types)),
+        "c=IN IP4 127.0.0.1",
+        "a=rtcp:9 IN IP4 0.0.0.0",
+        "a=ice-ufrag:%s" % ice_ufrag,
+        "a=ice-pwd:%s" % ice_pwd,
+        "a=ice-options:trickle",
+        "a=fingerprint:%s" % fingerprint,
+        "a=setup:active",
+        "a=mid:%s" % mid,
+    ]
+    lines.extend(candidates)
+    lines.extend(_sdp_extension_lines(
+        offered_extensions, accepted_extensions))
+    lines.extend(["a=%s" % direction, "a=rtcp-mux", "a=rtcp-rsize"])
+    lines.extend(_sdp_codec_lines(codecs))
+    if media_type == "video" and direction != "inactive":
+        lines.extend(_sdp_ssrc_lines(stream))
+    return lines
+
+
+def _sdp_build_answer(ortc, offer_info, stream=None):
+    ice = ortc.get("iceParameters") or {}
+    capabilities = _sdp_select_capabilities(ortc)
+    fingerprint = _sdp_fingerprint_line(ortc.get("dtlsParameters") or {})
+    ice_ufrag = ice.get("iceUfrag") or uuid.uuid4().hex[:8]
+    ice_pwd = ice.get("icePwd") or uuid.uuid4().hex
+    media_sections = offer_info.get("media") or []
+    if not media_sections:
+        raise RuntimeError("The camera offer has nothing to answer.")
+    lines = [
+        "v=0",
+        "o=- 0 0 IN IP4 127.0.0.1",
+        "s=AgoraGateway",
+        "t=0 0",
+        "a=group:BUNDLE %s" % offer_info["bundle_mids"],
+        "a=msid-semantic: WMS",
+        "a=ice-lite",
+    ]
+    if offer_info["extmap_allow_mixed"]:
+        lines.append("a=extmap-allow-mixed")
+    candidates = _sdp_candidate_lines(ice.get("candidates") or [])
+    for index, media in enumerate(media_sections):
+        lines.extend(_sdp_media_answer(
+            media, index, capabilities, offer_info,
+            ice_ufrag, ice_pwd, fingerprint, candidates, stream))
+    return "\r\n".join(lines) + "\r\n"
+
+
+# --- gateway messages -------------------------------------------------------
+
+def _agora_subscribe(uid, ssrc):
+    return {
+        "_id": _agora_id(),
+        "_type": "subscribe",
+        "_message": {
+            "stream_id": uid,
+            "stream_type": "video",
+            "mode": AGORA_CHANNEL_MODE,
+            "codec": AGORA_CHANNEL_CODEC,
+            "p2p_id": 1,
+            "twcc": True,
+            "rtx": True,
+            "extend": "",
+            "ssrcId": ssrc,
+        },
+    }
+
+
+def _agora_video_info(message):
+    uid = _as_int(message.get("uid"))
+    ssrc = _as_int(message.get("ssrcId"))
+    if not uid or not ssrc:
+        return None
+    if message.get("video") is False:
+        return None
+    rtx = message.get("rtxSsrcId")
+    return {
+        "uid": uid,
+        "ssrc": ssrc,
+        "rtx_ssrc": _as_int(rtx) if rtx is not None else None,
+        "cname": message.get("cname") or "",
+    }
+
+
+def _agora_find_video_streams(payload):
+    found = []
+    seen = set()
+
+    def visit(node):
+        if isinstance(node, dict):
+            info = None
+            looks_like_video = (
+                node.get("video") is True
+                or node.get("stream_type") == "video"
+                or node.get("type") == "video"
+                or node.get("codec") in ("h264", "h265")
+                or node.get("rtxSsrcId") is not None
+            )
+            if looks_like_video:
+                info = _agora_video_info(node)
+            if info:
+                key = (info["uid"], info["ssrc"])
+                if key not in seen:
+                    seen.add(key)
+                    found.append(info)
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(payload)
+    return found
+
+
+def _agora_merge_fingerprints(ortc, ap_response):
+    dtls = ortc.setdefault("dtlsParameters", {})
+    fingerprints = dtls.setdefault("fingerprints", [])
+    seen = {
+        str(item.get("fingerprint", "")).lower()
+        for item in fingerprints if item.get("fingerprint")
+    }
+    for address in ap_response.get("addresses", []):
+        value = address.get("fingerprint")
+        if not value:
+            continue
+        algorithm, _, fingerprint = value.partition(" ")
+        if not fingerprint:
+            algorithm, fingerprint = "sha-256", value
+        if fingerprint.lower() in seen:
+            continue
+        fingerprints.append({
+            "hashFunction": algorithm or "sha-256",
+            "fingerprint": fingerprint,
+        })
+        seen.add(fingerprint.lower())
+
+
+def _agora_join_message(credentials, ap_response, edge, ortc, session_id):
+    ap_payload = {
+        "code": ap_response["code"],
+        "server_ts": ap_response["server_ts"],
+        "uid": ap_response["uid"],
+        "cid": ap_response["cid"],
+        "cname": ap_response["cname"],
+        "detail": ap_response["detail"],
+        "flag": ap_response["flag"],
+        "opid": ap_response["opid"],
+        "cert": ap_response["ticket"],
+        "ticket": ap_response["ticket"],
+    }
+    if edge.get("ticket"):
+        ap_payload["ticket"] = edge["ticket"]
+    body = {
+        "p2p_id": 1,
+        "session_id": session_id,
+        "app_id": credentials.appid,
+        "channel_key": credentials.rtc_token,
+        "channel_name": credentials.channel,
+        "sdk_version": AGORA_SDK_VERSION,
+        "browser": AGORA_BROWSER_UA,
+        "process_id": "process-%s" % uuid.uuid4().hex[:16],
+        "mode": AGORA_CHANNEL_MODE,
+        "codec": AGORA_CHANNEL_CODEC,
+        "role": AGORA_ROLE,
+        "has_changed_gateway": False,
+        "ap_response": ap_payload,
+        "extend": "",
+        "details": {},
+        "features": {"rejoin": True},
+        "attributes": {
+            "userAttributes": {
+                "enableAudioMetadata": False,
+                "enableAudioPts": False,
+                "enablePublishedUserList": True,
+                "maxSubscription": 50,
+                "enableUserLicenseCheck": True,
+                "enableRTX": True,
+                "enableInstantVideo": False,
+                "enableDataStream2": False,
+                "enableAutFeedback": True,
+                "enableUserAutoRebalanceCheck": True,
+                "enableXR": True,
+                "enableLossbasedBwe": True,
+                "enableAutCC": True,
+                "enablePreallocPC": False,
+                "enablePubTWCC": False,
+                "enableSubTWCC": True,
+                "enablePubRTX": True,
+                "enableSubRTX": True,
+            },
+        },
+        "join_ts": int(_now() * 1000),
+        "ortc": ortc,
+    }
+    if credentials.is_encrypted:
+        body["aes_mode"] = credentials.web_encryption_mode
+        body["aes_secret"] = _agora_wrap_key(credentials.encryption_key)
+        body["aes_encrypt"] = True
+        if credentials.encryption_kdf_salt:
+            body["aes_salt"] = _agora_validate_salt(
+                credentials.encryption_kdf_salt)
+    return {
+        "_id": _agora_id(),
+        "_type": "join_v3",
+        "_message": body,
+    }
+
+
+def _agora_describe(response):
+    message = response.get("_message")
+    if isinstance(message, dict):
+        code = message.get("code") or message.get("error_code")
+        reason = (
+            message.get("reason") or message.get("error_str")
+            or message.get("error"))
+        if code == 2028:
+            return "code 2028 (ILLEGAL_AES_PASSWORD)"
+        if code is not None or reason is not None:
+            return "code %s: %s" % (code, reason)
+    return "result=%s" % response.get("_result")
+
+
+class AgoraSession(threading.Thread):
+    """Broker one browser camera session through Agora's signaling gateway.
+
+    The dashboard owns the websocket; this thread owns the protocol. Frames
+    from the page arrive on ``frames`` and messages back to the page are
+    posted with ``post_message``. Keeping the socket in the browser is what
+    avoids needing a per-session permission for the dynamic edge host.
+    """
+
+    def __init__(self, page, credentials, offer_sdp, generation):
+        threading.Thread.__init__(
+            self, name="anycubic-agora", daemon=True)
+        self.page = page
+        self.credentials = credentials
+        self.offer_sdp = offer_sdp
+        self.generation = generation
+        self.frames = queue.Queue()
+        self.closed = False
+        self.streams = {}
+        self.answer_sent = False
+
+    # -- messaging ---------------------------------------------------------
+
+    def feed(self, data):
+        if not self.closed:
+            self.frames.put(data)
+
+    def stop(self):
+        self.closed = True
+        self.frames.put(None)
+
+    def _post(self, payload):
+        # A stop or a reconnect bumps the generation; never let a worker from
+        # a superseded session talk to the dashboard or close the new camera.
+        if self.closed or self.generation != _webcam_generation:
+            return
+        try:
+            self.page.post_message(payload)
+        except Exception:
+            pass
+
+    def _send(self, message):
+        self._post({
+            "type": "webcam_agora_send",
+            "message": json.dumps(message),
+            "session": self.generation,
+        })
+
+    def _next(self, timeout):
+        try:
+            item = self.frames.get(timeout=max(0.05, timeout))
+        except queue.Empty:
+            return ""
+        if item is None:
+            self.closed = True
+            return None
+        return item
+
+    def _parse(self, raw):
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _fail(self, message):
+        if self.closed:
+            return
+        if self.generation != _webcam_generation:
+            self.stop()
+            return
+        self._post({
+            "type": "webcam",
+            "state": "error",
+            "error": message,
+        })
+        with STATE.lock:
+            if STATE.camera_state in ("starting", "connecting", "live"):
+                STATE.camera_state = "error"
+                STATE.camera_error = message
+                STATE.camera_started = 0.0
+        try:
+            camera_close(self.credentials.printer_id, timeout=10)
+        except Exception:
+            pass
+        self.stop()
+
+    # -- gateway events ----------------------------------------------------
+
+    def _handle_event(self, payload):
+        event = payload.get("_type")
+        message = payload.get("_message") or {}
+        if event == "on_add_video_stream":
+            info = _agora_video_info(message)
+            if info:
+                key = (info["uid"], info["ssrc"])
+                self.streams[key] = info
+                self._send(_agora_subscribe(info["uid"], info["ssrc"]))
+        elif event == "on_remove_video_stream":
+            uid = _as_int(message.get("uid"))
+            for key in list(self.streams):
+                if key[0] == uid:
+                    self.streams.pop(key, None)
+        elif event == "on_crypt_error":
+            self._fail(
+                "Agora rejected the camera channel encryption: %s" % message)
+        elif event == "on_p2p_lost":
+            self._fail("Agora lost the camera media path.")
+        elif event == "on_token_privilege_did_expire":
+            self._fail("The camera token expired. Start the camera again.")
+        elif event == "error":
+            # The gateway emits non-fatal errors during normal reconnects.
+            pass
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def run(self):
+        try:
+            offer_info = _sdp_parse_offer(self.offer_sdp)
+            ortc = _sdp_offer_to_ortc(offer_info["parsed"])
+            ap_response = _agora_choose_server(self.credentials)
+            if self.closed:
+                return
+            edge = ap_response["addresses"][0]
+            session_id = uuid.uuid4().hex
+            join = _agora_join_message(
+                self.credentials, ap_response, edge, ortc, session_id)
+            join_id = join["_id"]
+            ws_url = "wss://%s.edge.agora.io:%s" % (
+                edge["ip"].replace(".", "-"), edge["port"])
+            self._post({
+                "type": "webcam_agora_join",
+                "ws_url": ws_url,
+                "join": json.dumps(join),
+                "session": self.generation,
+            })
+
+            # The browser forwards every gateway frame here. The first one
+            # that carries our join id is the answer to the join.
+            message = None
+            deadline = time.monotonic() + AGORA_JOIN_TIMEOUT
+            while not self.closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Agora did not answer the camera join request.")
+                raw = self._next(remaining)
+                if raw is None:
+                    return
+                payload = self._parse(raw) if raw else None
+                if not payload:
+                    continue
+                if payload.get("_id") == join_id:
+                    if payload.get("_result") != "success":
+                        raise RuntimeError(
+                            "Agora rejected the camera join: %s"
+                            % _agora_describe(payload))
+                    message = payload.get("_message") or {}
+                    break
+                self._handle_event(payload)
+            if self.closed:
+                return
+
+            reply_ortc = message.get("ortc") if message else None
+            if not isinstance(reply_ortc, dict) or not reply_ortc:
+                raise RuntimeError(
+                    "Agora accepted the camera join but sent no media "
+                    "parameters.")
+            _agora_merge_fingerprints(reply_ortc, ap_response)
+            self._send({
+                "_id": _agora_id(),
+                "_type": "set_client_role",
+                "_message": {
+                    "role": AGORA_ROLE,
+                    "level": 0,
+                    "client_ts": int(_now() * 1000),
+                },
+            })
+            for info in _agora_find_video_streams(message):
+                self.streams[(info["uid"], info["ssrc"])] = info
+                self._send(_agora_subscribe(info["uid"], info["ssrc"]))
+
+            # The remote SSRC must be in the first answer; the browser cannot
+            # learn it later without a renegotiation the gateway does not
+            # support. Wait briefly for the printer to start publishing.
+            deadline = time.monotonic() + AGORA_STREAM_ANNOUNCE_TIMEOUT
+            while (not self.streams and not self.closed
+                   and time.monotonic() < deadline):
+                raw = self._next(min(0.5, deadline - time.monotonic()))
+                if raw is None:
+                    return
+                payload = self._parse(raw) if raw else None
+                if payload:
+                    self._handle_event(payload)
+            if self.closed:
+                return
+
+            stream = next(iter(self.streams.values()), None)
+            answer = _sdp_build_answer(reply_ortc, offer_info, stream)
+            self.answer_sent = True
+            self._post({
+                "type": "webcam_agora_answer",
+                "sdp": answer,
+                "session": self.generation,
+            })
+
+            while not self.closed:
+                raw = self._next(1.0)
+                if raw is None:
+                    return
+                payload = self._parse(raw) if raw else None
+                if payload:
+                    self._handle_event(payload)
+        except Exception as exc:
+            self._fail("Agora camera failed: %s" % exc)
+
 
 class PluginState:
     def __init__(self):
@@ -2201,7 +3366,7 @@ def stop_monitoring():
 
 
 # ============================================================================
-# Camera: order 1001 / MQTT startCapture / KVS WebRTC viewer
+# Camera: order 1001 / Agora or KVS WebRTC viewer
 # ============================================================================
 
 _webcam_lock = threading.RLock()
@@ -2212,10 +3377,12 @@ _webcam_generation = 0
 
 
 def camera_open(printer_id=None):
-    """Open the printer camera and return its temporary AWS credentials.
+    """Open the printer camera and return its stream credentials.
 
-    Returns ``(session, error)``. The order is read-only with respect to the
-    print: it only makes the camera available to a KVS viewer.
+    Returns ``(session, error)``. ``session["mode"]`` is ``"agora"`` for the
+    new shengwang service or ``"kvs"`` for the legacy AWS path. The order is
+    read-only with respect to the print: it only makes the camera available
+    to a viewer.
     """
     with STATE.lock:
         token = STATE.workbench_token
@@ -2229,9 +3396,16 @@ def camera_open(printer_id=None):
     if not pid:
         return None, "Select a printer first."
     try:
+        # Both details are load-bearing and fail only as the misleading
+        # "Video service upgraded. Update the slicer to enable." message:
+        # order_id is a string, and shengwang_rtc_support is top-level.
         response = _http_json(
             "POST", SEND_ORDER_PATH,
-            {"order_id": CAMERA_OPEN_ORDER, "printer_id": pid},
+            {
+                "order_id": str(CAMERA_OPEN_ORDER),
+                "printer_id": pid,
+                "shengwang_rtc_support": True,
+            },
             token=token, timeout=30,
         )
     except Exception as exc:
@@ -2241,12 +3415,38 @@ def camera_open(printer_id=None):
             response.get("msg") or "unknown error")
     data = response.get("data") or {}
     try:
+        agora = _agora_credentials(data, pid)
+    except Exception as exc:
+        return None, str(exc)
+    if agora is not None:
+        return {
+            "printer_id": pid,
+            "msgid": data.get("msgid") or agora.msgid,
+            "mode": "agora",
+            "credentials": agora,
+        }, ""
+    if not data.get("token"):
+        # The cloud says "Operation successful" but omits the credential
+        # block when another session (the slicer or the phone app) already
+        # holds the printer's camera.
+        detail = response.get("msg") or ""
+        if detail and "upgraded" in detail.lower():
+            return None, detail
+        return None, (
+            "The printer returned no camera credentials. If Anycubic "
+            "Slicer Next or the phone app is showing this camera, close it "
+            "and try again; otherwise the printer may not have a camera.")
+    try:
         creds = _camera_credentials(data.get("token") or {})
     except Exception as exc:
+        detail = response.get("msg") or ""
+        if detail and "upgraded" in detail.lower():
+            return None, detail
         return None, str(exc)
     return {
         "printer_id": pid,
         "msgid": data.get("msgid") or "",
+        "mode": "kvs",
         "credentials": creds,
     }, ""
 
@@ -2276,12 +3476,14 @@ def camera_close(printer_id=None, timeout=20):
     return True, "Camera closed."
 
 
-def webcam_start():
-    """Open the camera, ask it to push, and return a viewer configuration.
+def webcam_start(page=None):
+    """Open the camera and return the viewer configuration for its service.
 
-    Returns ``(ok, message, config)``. ``config`` contains the presigned WSS
-    URL and STUN servers for the dashboard; the AWS secret key never leaves
-    the plugin process.
+    Returns ``(ok, message, config)``. ``config["mode"]`` selects the
+    dashboard player: ``"kvs"`` uses the legacy AWS signaling URL, ``"agora"``
+    asks the page for an SDP offer and lets the plugin broker the Agora join.
+    ``page`` is kept so the Agora session can post frames back to the
+    dashboard that asked for the stream.
     """
     global _webcam_in_flight, _webcam_session, _webcam_generation
 
@@ -2290,6 +3492,7 @@ def webcam_start():
             return False, "The camera is already starting.", None
         _webcam_in_flight = True
 
+    generation = None
     try:
         # A stop releases the printer camera with order 1002. Do not open a
         # new session until that request has finished, or the old close could
@@ -2324,24 +3527,29 @@ def webcam_start():
             raise RuntimeError("Select a printer first.")
         if service is None or not service.running:
             raise RuntimeError(
-                "Start monitoring first. The camera needs the MQTT "
-                "connection to ask the printer for video.")
-        if not mqtt_connected:
-            raise RuntimeError(
-                "MQTT is not connected yet. Wait for the dashboard to go "
-                "live, then start the camera.")
+                "Start monitoring first. The camera uses the cloud "
+                "session that monitoring keeps alive.")
 
         with STATE.lock:
             STATE.camera_state = "starting"
             STATE.camera_error = ""
             STATE.camera_started = 0.0
 
-        # Reconnecting replaces any previous camera session cleanly.
+        # Reconnecting replaces any previous camera session cleanly. Only the
+        # legacy KVS path uses the MQTT start/stopCapture handshake.
         if previous is not None or state in ("starting", "connecting", "live"):
-            try:
-                service.publish_video("stopCapture")
-            except Exception:
-                pass
+            previous_mode = (previous or {}).get("mode", "kvs")
+            previous_worker = (previous or {}).get("agora")
+            if previous_worker is not None:
+                try:
+                    previous_worker.stop()
+                except Exception:
+                    pass
+            if previous_mode == "kvs":
+                try:
+                    service.publish_video("stopCapture")
+                except Exception:
+                    pass
             try:
                 camera_close(printer.get("id"), timeout=10)
             except Exception:
@@ -2350,7 +3558,50 @@ def webcam_start():
         opened, error = camera_open(printer.get("id"))
         if not opened:
             raise RuntimeError(error)
+        mode = opened.get("mode") or "kvs"
         creds = opened["credentials"]
+
+        if mode == "agora":
+            # The camera order itself makes the printer join the Agora
+            # channel. No MQTT startCapture is involved.
+            with _webcam_lock:
+                cancelled = generation != _webcam_generation
+                if not cancelled:
+                    _webcam_session = {
+                        "printer_id": opened["printer_id"],
+                        "order_msgid": opened["msgid"],
+                        "started": _now(),
+                        "mode": "agora",
+                        "credentials": creds,
+                        "agora": None,
+                        "page": page,
+                    }
+                    with STATE.lock:
+                        STATE.camera_state = "connecting"
+                        STATE.camera_started = _now()
+                        STATE.camera_error = ""
+            if cancelled:
+                try:
+                    camera_close(printer.get("id"))
+                except Exception:
+                    pass
+                raise RuntimeError("Camera start was cancelled.")
+            return True, "Camera opened. Waiting for the first frame…", {
+                "mode": "agora",
+                # The join can wait up to 20 s for the gateway and another
+                # 10 s for the printer to announce its stream.
+                "first_frame_timeout": 45000,
+            }
+
+        if not mqtt_connected:
+            try:
+                camera_close(printer.get("id"))
+            except Exception:
+                pass
+            raise RuntimeError(
+                "MQTT is not connected yet. Wait for the dashboard to go "
+                "live, then start the camera.")
+
         try:
             channel_arn = _kvs_channel_arn(printer.get("key"), creds)
             endpoint = _kvs_wss_endpoint(channel_arn, creds)
@@ -2393,6 +3644,7 @@ def webcam_start():
                     "printer_id": opened["printer_id"],
                     "order_msgid": opened["msgid"],
                     "started": _now(),
+                    "mode": "kvs",
                     "channel_arn": channel_arn,
                     "client_id": client_id,
                 }
@@ -2414,6 +3666,7 @@ def webcam_start():
             raise RuntimeError("Camera start was cancelled.")
 
         return True, "Camera opened. Waiting for the first frame…", {
+            "mode": "kvs",
             "wss_url": wss_url,
             "ice_servers": [dict(item) for item in KVS_STUN_SERVERS],
             "expires_in": KVS_WSS_EXPIRES,
@@ -2422,7 +3675,7 @@ def webcam_start():
         }
     except Exception as exc:
         with _webcam_lock:
-            current = generation == _webcam_generation
+            current = generation is None or generation == _webcam_generation
             if current:
                 _webcam_session = None
         if current:
@@ -2434,6 +3687,39 @@ def webcam_start():
     finally:
         with _webcam_lock:
             _webcam_in_flight = False
+
+
+def webcam_agora_offer(sdp):
+    """Start an Agora session for the browser's SDP offer."""
+    with _webcam_lock:
+        session = _webcam_session
+        generation = _webcam_generation
+        if not session or session.get("mode") != "agora":
+            return False, "The camera is not waiting for an Agora offer."
+        page = session.get("page")
+        if page is None:
+            return False, "The camera dashboard is no longer available."
+        credentials = session.get("credentials")
+        previous = session.get("agora")
+        if previous is not None:
+            try:
+                previous.stop()
+            except Exception:
+                pass
+        worker = AgoraSession(page, credentials, sdp, generation)
+        session["agora"] = worker
+
+    worker.start()
+    return True, "Agora session started."
+
+
+def webcam_agora_feed(data):
+    """Route one gateway frame from the dashboard to the active session."""
+    with _webcam_lock:
+        session = _webcam_session
+        worker = session.get("agora") if session else None
+    if worker is not None:
+        worker.feed(data)
 
 
 def webcam_stop():
@@ -2464,7 +3750,14 @@ def webcam_stop():
                     STATE.camera_started = 0.0
             return True, "The camera is not running."
 
-        if service is not None and service.running:
+        mode = (session or {}).get("mode", "kvs")
+        worker = (session or {}).get("agora")
+        if worker is not None:
+            try:
+                worker.stop()
+            except Exception:
+                pass
+        if mode == "kvs" and service is not None and service.running:
             try:
                 service.publish_video("stopCapture")
             except Exception:
@@ -2716,6 +4009,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   var camTimer = null;
   var camState = "idle";
   var camPendingCandidates = [];
+  var camAG = null;
 
   function $(id) { return document.getElementById(id); }
   function set(id, value) {
@@ -3008,6 +4302,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     var ws = camWS;
     camWS = null;
     if (ws) { try { ws.close(); } catch (e) {} }
+    var ag = camAG;
+    camAG = null;
+    if (ag) {
+      if (ag.ping) { clearInterval(ag.ping); ag.ping = null; }
+      if (ag.ws) { try { ag.ws.close(); } catch (e) {} }
+    }
     camPendingCandidates = [];
     var video = $("camVideo");
     try { video.pause(); } catch (e) {}
@@ -3231,10 +4531,162 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }, (cfg && cfg.first_frame_timeout) || 20000);
   }
+  async function camConnectAgora(cfg) {
+    camCleanup();
+    camState = "connecting";
+    camSetBadge("Connecting…", "off");
+    $("camPlaceholder").textContent = "Joining the printer's Agora camera channel…";
+    $("camPlaceholder").style.display = "flex";
+    $("camError").style.display = "none";
+    $("camStats").textContent = "";
+    updateCameraControls();
+
+    var pc = new RTCPeerConnection({
+      iceServers: [],
+      bundlePolicy: "max-bundle"
+    });
+    camPC = pc;
+    var video = $("camVideo");
+    video.onloadeddata = function () {
+      if (camPC !== pc) return;
+      if (camTimer) { clearTimeout(camTimer); camTimer = null; }
+      camState = "live";
+      camSetBadge("Live", "ok");
+      $("camPlaceholder").style.display = "none";
+      $("camStats").textContent = video.videoWidth + "×" + video.videoHeight;
+      updateCameraControls();
+      B.postMessage({ type: "webcam_viewing" });
+    };
+    pc.ontrack = function (ev) {
+      if (camPC !== pc) return;
+      var stream = null;
+      if (ev.streams && ev.streams.length) stream = ev.streams[0];
+      else {
+        try { stream = new MediaStream([ev.track]); } catch (e) {}
+      }
+      if (!stream) return;
+      video.srcObject = stream;
+      var playing = video.play();
+      if (playing && playing.catch) playing.catch(function () {});
+    };
+    pc.onconnectionstatechange = function () {
+      if (camPC !== pc) return;
+      if (pc.connectionState === "failed") {
+        camFail("The camera connection failed. Check that the printer is online, then press Reconnect.");
+      }
+    };
+
+    // Only H.264 is published. Keep its RTX codec in the offer too, because
+    // the gateway may answer with a retransmission stream.
+    try {
+      var caps = RTCRtpReceiver.getCapabilities("video");
+      var codecs = (caps && caps.codecs) ? caps.codecs : [];
+      var h264 = codecs.filter(function (c) {
+        var mime = (c.mimeType || "").toLowerCase();
+        return mime === "video/h264" || mime === "video/rtx";
+      });
+      var transceiver = pc.addTransceiver("video", { direction: "recvonly" });
+      if (h264.length && transceiver.setCodecPreferences) {
+        transceiver.setCodecPreferences(h264);
+      }
+    } catch (e) {
+      try { pc.addTransceiver("video", { direction: "recvonly" }); } catch (e2) {}
+    }
+
+    var offer;
+    try {
+      offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+    } catch (e) {
+      camFail("Could not create the camera offer: " + e.message);
+      return;
+    }
+    // The plugin needs the browser's ICE credentials and candidates in the
+    // first—and only—join message, so wait for gathering to finish.
+    await new Promise(function (resolve) {
+      if (pc.iceGatheringState === "complete") return resolve();
+      var done = false;
+      function finish() {
+        if (done) return;
+        done = true;
+        resolve();
+      }
+      pc.onicegatheringstatechange = function () {
+        if (pc.iceGatheringState === "complete") finish();
+      };
+      setTimeout(finish, 8000);
+    });
+    if (camPC !== pc) return;
+
+    B.postMessage({ type: "webcam_agora_offer", sdp: pc.localDescription.sdp });
+    camTimer = setTimeout(function () {
+      if (camPC === pc && camState !== "live") {
+        camFail("No video arrived from the Agora camera. The printer may be busy or the camera may be disconnected.");
+      }
+    }, (cfg && cfg.first_frame_timeout) || 45000);
+  }
+  function camAgoraJoin(d) {
+    if (!camPC) return;
+    if (camAG) {
+      var old = camAG;
+      camAG = null;
+      if (old.ping) { clearInterval(old.ping); old.ping = null; }
+      if (old.ws) { try { old.ws.close(); } catch (e) {} }
+    }
+    var ws;
+    try {
+      ws = new WebSocket(d.ws_url);
+    } catch (e) {
+      camFail("Could not open the Agora signaling connection: " + e.message);
+      return;
+    }
+    var ag = { ws: ws, ping: null, session: d.session };
+    camAG = ag;
+    ws.onopen = function () {
+      if (camAG !== ag) return;
+      try {
+        ws.send(d.join);
+      } catch (e) {
+        camFail("Could not send the Agora join request: " + e.message);
+        return;
+      }
+      ag.ping = setInterval(function () {
+        if (camAG !== ag || ws.readyState !== 1) return;
+        try {
+          ws.send(JSON.stringify({
+            _id: Math.random().toString(16).slice(2, 8),
+            _type: "ping"
+          }));
+        } catch (e) {}
+      }, 3000);
+    };
+    ws.onmessage = function (ev) {
+      if (camAG !== ag) return;
+      B.postMessage({ type: "webcam_agora_frame", data: ev.data });
+    };
+    ws.onclose = function () {
+      if (camAG !== ag) return;
+      camFail("The Agora camera connection closed. Press Reconnect.");
+    };
+  }
+  function camAgoraSend(d) {
+    if (!camAG || camAG.ws.readyState !== 1) return;
+    try { camAG.ws.send(d.message); } catch (e) {}
+  }
+  function camAgoraAnswer(d) {
+    if (!camPC) return;
+    if (camAG && d.session !== undefined && camAG.session !== d.session) return;
+    var pc = camPC;
+    pc.setRemoteDescription({ type: "answer", sdp: d.sdp }).catch(function (e) {
+      if (camPC !== pc) return;
+      camFail("Could not apply the camera answer: " + (e && e.message ? e.message : e));
+    });
+  }
   function renderWebcam(d) {
     if (!d) return;
     if (d.state === "ready") {
-      camConnect(d).catch(function (e) {
+      var setup = (d.mode === "agora") ? camConnectAgora : camConnect;
+      setup(d).catch(function (e) {
         camFail("Camera setup failed: " + (e && e.message ? e.message : e));
       });
       return;
@@ -3259,16 +4711,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     var d = lastStatus || {};
     var hasPrinter = !!(d.printer && d.printer.name);
     var online = !!(d.printer && d.printer.online);
-    var mqtt = !!(d.mqtt && d.mqtt.connected);
+    var monitoring = !!d.monitoring;
     var active = camState === "starting" || camState === "connecting" || camState === "live";
-    $("btnCamStart").disabled = !(d.login && hasPrinter && online && mqtt) || active;
+    $("btnCamStart").disabled = !(d.login && hasPrinter && online && monitoring) || active;
     $("btnCamReconnect").disabled = !active && camState !== "error";
     $("btnCamStop").disabled = !active && camState !== "error";
     var hint;
     if (!d.login) hint = "Sign in to use the camera.";
     else if (!hasPrinter) hint = "Select a printer first.";
     else if (!online) hint = "The printer is offline on Anycubic Cloud.";
-    else if (!mqtt) hint = "Start monitoring first: the camera opens over the printer's MQTT channel.";
+    else if (!monitoring) hint = "Start monitoring first: the dashboard needs the printer's cloud session.";
     else if (camState === "live") hint = "Live view. The camera does not affect the print.";
     else if (camState === "starting" || camState === "connecting") hint = "Opening the camera…";
     else if (camState === "error") hint = "Camera unavailable. Check the printer and try again.";
@@ -3298,6 +4750,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     if (d && d.type === "webcam") {
       renderWebcam(d);
+      return;
+    }
+    if (d && d.type === "webcam_agora_join") {
+      camAgoraJoin(d);
+      return;
+    }
+    if (d && d.type === "webcam_agora_answer") {
+      camAgoraAnswer(d);
+      return;
+    }
+    if (d && d.type === "webcam_agora_send") {
+      camAgoraSend(d);
       return;
     }
     if (!d || d.type !== "status") {
@@ -3786,6 +5250,28 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
             self._webcam_stop_async()
             return
 
+        if kind == "webcam_agora_offer":
+            sdp = data.get("sdp") or ""
+            if not sdp:
+                self.post_message({
+                    "type": "webcam",
+                    "state": "error",
+                    "error": "The dashboard did not send a camera offer.",
+                })
+                return
+            ok, message = webcam_agora_offer(sdp)
+            if not ok:
+                self.post_message({
+                    "type": "webcam",
+                    "state": "error",
+                    "error": message,
+                })
+            return
+
+        if kind == "webcam_agora_frame":
+            webcam_agora_feed(data.get("data") or "")
+            return
+
         if kind == "webcam_viewing":
             webcam_mark_viewing()
             self._post_status()
@@ -3799,22 +5285,25 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
 
         def worker():
             try:
-                ok, message, config = webcam_start()
+                ok, message, config = webcam_start(page)
             except Exception as exc:
                 ok, message, config = False, "Camera failed: %s" % exc, None
             if ok and config:
                 try:
-                    page.post_message({
+                    payload = {
                         "type": "webcam",
                         "state": "ready",
-                        "wss_url": config["wss_url"],
-                        "ice_servers": config["ice_servers"],
-                        "expires_in": config["expires_in"],
+                        "mode": config.get("mode", "kvs"),
                         "first_frame_timeout": config.get(
                             "first_frame_timeout",
                             int(CAMERA_FIRST_FRAME_TIMEOUT * 1000)),
                         "message": message,
-                    })
+                    }
+                    if payload["mode"] == "kvs":
+                        payload["wss_url"] = config["wss_url"]
+                        payload["ice_servers"] = config["ice_servers"]
+                        payload["expires_in"] = config["expires_in"]
+                    page.post_message(payload)
                 except Exception:
                     pass
             else:
@@ -4111,7 +5600,10 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
                 service = STATE.mqtt_service
                 camera_on = STATE.camera_state in (
                     "starting", "connecting", "live")
-            if camera_on and service is not None and service.running:
+            with _webcam_lock:
+                mode = (_webcam_session or {}).get("mode", "kvs")
+            if camera_on and mode == "kvs" and service is not None \
+                    and service.running:
                 service.publish_video("stopCapture")
         except Exception:
             pass
@@ -4284,13 +5776,13 @@ class AnycubicCloudPlugin(orca.base):
                 "('cloud-universe.anycubic.com', 443)",
                 "https://workbentch.s3.us-east-2.amazonaws.com",
                 "https://workbench.s3.us-east-2.amazonaws.com",
-            ] + KVS_HTTP_PERMISSIONS,
+            ] + KVS_HTTP_PERMISSIONS + AGORA_AP_HTTP_PERMISSIONS,
             network_socket=[
                 "('', 0)",
                 "('mqtt-universe.anycubic.com', 8883)",
                 "mqtt-universe.anycubic.com:8883",
                 "('cloud-universe.anycubic.com', 443)",
-            ] + KVS_SOCKET_PERMISSIONS,
+            ] + KVS_SOCKET_PERMISSIONS + AGORA_AP_SOCKET_PERMISSIONS,
             threading=True,
         )
         orca.register_capability(AnycubicCloudPage)
