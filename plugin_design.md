@@ -27,7 +27,7 @@ Basis: protocol facts verified in `mqtt_auth_protocol.md`. Everything else is ma
 | F7 | Task progress | MQTT `status/report` plus active-project `progress` from `getProjects` | Partial — heartbeat plus 5 s project refresh while the dashboard is open |
 | F8 | Pause/resume/stop | `POST /work/operation/sendOrder` order 2/3/4 with the active `project_id`. Active job from `GET /work/project/getProjects`; paused when `pause != 0` and `print_status == 1`. Dashboard controls are confirmation-gated (§3.7) | **Implemented**; live command test pending explicit user consent (G6) |
 | F9 | Token lifecycle | JWT exp ≈ Oct 2027, but rotated server-side on re-login. Relogin before MQTT boot. On rc=5, relogin once, then reconnect | Verified. Interaction with official app: see P3 |
-| F10 | Webcam | order 1001 → temporary AWS STS credentials → KVS `describeSignalingChannel` / `getSignalingChannelEndpoint` → SigV4-presigned WSS URL → MQTT `video/startCapture` → browser WebRTC (H.264). Stop: MQTT `stopCapture` + order 1002. AMS still n/a for the Kobra 2 Pro | **Verified live** (2026-10-27): 640×480 H.264 playback over STUN; panel added in v0.7.0 (§3.8). Orca WebView playback gated on G7 |
+| F10 | Webcam | order 1001 (`order_id` string + `shengwang_rtc_support`) → Agora `shengwang` (no MQTT command) or legacy KVS STS → `describeSignalingChannel` / `getSignalingChannelEndpoint` → SigV4-presigned WSS URL → MQTT `video/startCapture` → browser WebRTC (H.264). Stop: order 1002 (+ MQTT `stopCapture` on KVS). AMS still n/a for the Kobra 2 Pro | KVS **verified live** (2026-10-27): 640×480 H.264 over STUN; panel v0.7.0. Agora implemented v0.8.3, live order response pending printer online (§3.8). Orca WebView playback gated on G7 |
 
 **Honest v1 scope:** monitoring works (F1–F4, F9). Upload and start print are verified live (F5, F6). Pause/resume/stop are implemented against the confirmed project-control order shape (F8), but the first live command is still gated on G6 (explicit consent, attended printer). F7 remains heartbeat-limited between project refreshes. The webcam protocol is verified end-to-end in Chromium (F10); the same code path inside Orca's WebView is not yet confirmed.
 
@@ -98,11 +98,11 @@ A remote start must:
 - Commands run on a worker thread with a single in-flight guard. The cached project is patched optimistically after an accepted order and reconciled by the next refresh.
 - Nothing here runs automatically. A print is only paused or stopped by an explicit user click.
 
-### 3.8 Webcam (F10, verified live 2026-10-27)
-The printer publishes an AWS Kinesis Video Streams (KVS) WebRTC master on a channel named after the printer key. It is not HTTP/HLS: there is no snapshot or MJPEG URL. Playback needs a signaling exchange and, once connected, a UDP media path.
+### 3.8 Webcam (F10, KVS verified live 2026-10-27; Agora added 2026-10-30)
+The cloud camera has two transports. Newer firmware publishes through Agora ("shengwang") SD-RTN; older firmware publishes an AWS Kinesis Video Streams (KVS) WebRTC master on a channel named after the printer key. Neither is HTTP/HLS: there is no snapshot or MJPEG URL. Playback needs a signaling exchange and, once connected, a UDP media path.
 
 Sequence implemented by the plugin:
-1. `POST /work/operation/sendOrder {"order_id":1001,"printer_id":<id>}`. `data.msgid` is the camera session id; `data.token` contains temporary AWS STS credentials: `region`, `sessionToken`, `tmpSecretId`, `tmpSecretKey`. Credentials stay in Python memory.
+1. `POST /work/operation/sendOrder {"order_id":"1001","printer_id":<id>,"shengwang_rtc_support":true}`. The order id must be a string and the flag top-level; without them the cloud answers "Video service upgraded. Update the slicer to enable." `data.msgid` is the camera session id. `data.shengwang` selects the Agora path; `data.token` contains temporary AWS STS credentials (`region`, `sessionToken`, `tmpSecretId`, `tmpSecretKey`) for the legacy KVS path. Credentials stay in Python memory.
 2. `POST https://kinesisvideo.<region>.amazonaws.com/describeSignalingChannel` `{"ChannelName":<printer key>}` (SigV4, rest-json) → channel ARN.
 3. `POST .../getSignalingChannelEndpoint` with `{ChannelARN, SingleMasterChannelEndpointConfiguration:{Protocols:["WSS"], Role:"VIEWER"}}` → the viewer WSS host (e.g. `wss://v-xxxx.kinesisvideo.us-east-2.amazonaws.com`).
 4. Python SigV4-presigns that WSS URL with `X-Amz-ChannelARN`, `X-Amz-ClientId` and `X-Amz-Expires=299`. Only this URL is posted to the dashboard; the AWS secret key never leaves the plugin.
@@ -110,12 +110,18 @@ Sequence implemented by the plugin:
 6. The dashboard opens the WSS URL and sends `SDP_OFFER` / `ICE_CANDIDATE`; the answer arrives as base64 JSON in `messagePayload`. The offer must be restricted to H.264 with `RTCRtpTransceiver.setCodecPreferences`; the default multi-codec Chromium offer gets an empty SDP answer.
 7. Stop publishes `stopCapture` and sends order 1002. Closing the dashboard also stops the camera before MQTT is disconnected.
 
+Agora path (replaces steps 2–6; no MQTT command is used):
+1. Python POSTs the channel and `rtc_token` to Agora's access point (`https://webrtc2-ap-web-1.agora.io/api/v2/transpond/webrtc?v=2`, with three backups) and receives the edge address, ticket and per-edge DTLS fingerprint.
+2. Python turns the browser's SDP offer into Agora's ORTC form, wraps the channel AES key with the SDK's RSA-OAEP public key, and builds `join_v3`.
+3. The dashboard opens the edge websocket (`wss://<ip-with-dashes>.edge.agora.io:<port>`) because Orca's plugin sandbox cannot grant the dynamic `*.edge.agora.io` host. Every gateway frame is relayed to Python, which subscribes to the announced video SSRC and returns the SDP answer. The browser remains the WebRTC peer; Python never carries media.
+4. Pings run every 3 s from the dashboard. A gateway crypt error, token expiry, lost media path or socket close fails the panel and closes order 1002.
+
 Details:
 - **STUN-only ICE.** The KVS ICE endpoint is a per-channel `r-*.kinesisvideo` host that is unknown until the camera is open. Orca grants URL and socket targets, not host wildcards, so the plugin does not call the KVS ICE API. Public STUN (`stun.l.google.com:19302`, `stun1.l.google.com`, `stun.cloudflare.com:3478`) is enough on a normal home network and was verified live; TURN fallback is not implemented. Symmetric NAT/CGNAT networks will fail with a clear "No video arrived" message after 20 s.
-- **Permissions.** `network_http` and `network_socket` include the five fixed regional `kinesisvideo.<region>.amazonaws.com` control-plane hosts. The WSS media host is contacted by the dashboard WebView, not by Python, so it needs no plugin grant. The `r-*` ICE host is never contacted.
-- **Version note.** v0.7.0 adds the panel. The camera is viewer-only: the only printer-side messages are `startCapture` and `stopCapture`, and it never touches the active print.
-- **Failure handling.** Any failure after order 1001 closes the order (`1002`) and publishes `stopCapture` where possible. Start/stop use an in-flight guard plus a generation counter so a cancelled or superseded start cannot leave a camera session open. `on_unload` publishes `stopCapture` synchronously, then finishes order 1002 and the MQTT disconnect on a worker thread.
-- **Open:** OrcaSlicer's WebView must support `RTCPeerConnection`, `RTCRtpReceiver.getCapabilities`, a WSS connection to AWS and outbound STUN/UDP. This is verified in Chromium but not yet inside Orca (G7). If the WebView blocks the WSS host, playback needs a native bridge and this design must be revisited.
+- **Permissions.** `network_http` and `network_socket` include the five fixed regional `kinesisvideo.<region>.amazonaws.com` control-plane hosts plus the four fixed Agora access-point domains. The WSS media hosts (AWS `v-*`/`r-*` and Agora `*.edge.agora.io`) are contacted by the dashboard WebView, not by Python, so they need no plugin grant.
+- **Version note.** v0.7.0 added the panel; v0.8.3 adds Agora and the corrected order-1001 shape. The camera is viewer-only and never touches the active print.
+- **Failure handling.** Any failure after order 1001 closes the order (`1002`) and publishes `stopCapture` where possible (KVS only). Start/stop use an in-flight guard plus a generation counter so a cancelled or superseded start cannot leave a camera session open. A superseded Agora worker cannot post frames or close the replacement session. `on_unload` publishes `stopCapture` synchronously, then finishes order 1002 and the MQTT disconnect on a worker thread.
+- **Open:** OrcaSlicer's WebView must support `RTCPeerConnection`, `RTCRtpReceiver.getCapabilities`, WSS connections to AWS/Agora and outbound STUN/UDP. This is verified in Chromium but not yet inside Orca (G7). If the WebView blocks either WSS host, playback needs a native bridge and this design must be revisited. The live Agora order-1001 response is untested because the printer was offline during development.
 
 ## 4. Device integration options
 - A. Virtual device profile: best UX, needs deep Orca internals.

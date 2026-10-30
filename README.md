@@ -15,7 +15,7 @@ This plugin adds a **native dashboard** inside OrcaSlicer for managing Anycubic 
 | **Live printer status** | Temperatures, print state, layer/progress via MQTT (300 s heartbeat) |
 | **G-code upload** | Watched-folder panel (`~/Downloads` by default) → uploads to Anycubic Cloud → starts print after explicit confirmation |
 | **Print controls** | Pause / Resume / Stop with confirmation dialogs. Only enabled when a job is actually running. Uses HTTP `sendOrder` (orders 2/3/4), not MQTT. |
-| **Webcam panel** | Opens the printer's cloud camera (order 1001), streams via **AWS Kinesis Video Streams WebRTC** (H.264, 640×480), plays in the dashboard. Stop closes cleanly (MQTT `stopCapture` + order 1002). |
+| **Webcam panel** | Opens the printer's cloud camera (order 1001) and plays its WebRTC feed. Newer firmware uses **Agora (shengwang)**; older firmware uses **AWS Kinesis Video Streams**. The plugin detects the transport from the response. Stop closes cleanly (order 1002, plus MQTT `stopCapture` on KVS). |
 
 ---
 
@@ -26,7 +26,7 @@ This plugin adds a **native dashboard** inside OrcaSlicer for managing Anycubic 
 - Printer registered in Anycubic Cloud app
 - OrcaSlicer permissions granted on first run:
   - Filesystem read: `~/Downloads`, `~/Desktop`, `~/Documents`
-  - Network: `cloud-universe.anycubic.com`, S3, **`kinesisvideo.*.amazonaws.com`** (for camera)
+  - Network: `cloud-universe.anycubic.com`, S3, **`kinesisvideo.*.amazonaws.com`**, **`webrtc2-ap-web-*.agora.io`** / **`webrtc2-*.ap.sd-rtn.com`** (for camera)
   - MQTT socket: `mqtt-universe.anycubic.com:8883`
 
 ---
@@ -56,7 +56,7 @@ This plugin adds a **native dashboard** inside OrcaSlicer for managing Anycubic 
 ## Security / Privacy
 
 - Your Anycubic credentials **never leave OrcaSlicer**. The plugin exchanges the RS256 JWT for a workbench token locally.
-- AWS temporary credentials (from order 1001) stay in plugin memory; only the **presigned WSS URL** is sent to the dashboard WebView.
+- AWS temporary credentials and Agora `rtc_token` / channel keys (from order 1001) stay in plugin memory. On KVS, only the **presigned WSS URL** reaches the dashboard. On Agora, the dashboard receives the edge websocket URL and the join message so the browser can be the WebRTC peer; the channel key is RSA-wrapped for Agora's edge.
 - No telemetry, no external analytics, no auto-updates.
 
 ---
@@ -78,7 +78,7 @@ The `_any` suffix is OrcaCloud's universal target. The plugin declares its depen
 Every release is built from `master` and published by `.github/workflows/publish-orcacloud.yml`:
 
 ```bash
-scripts/release.sh 0.8.2 "## v0.8.2
+scripts/release.sh 0.8.3 "## v0.8.3
 - What changed"
 ```
 
@@ -92,7 +92,8 @@ Always tag `master` HEAD. GitHub runs the workflow file from the tagged commit, 
 
 - Upload → start print ✔
 - Pause / Resume / Stop payloads ✔ (live command gated on explicit user consent)
-- Camera: order 1001 → KVS channel ARN → viewer WSS → SigV4 presign → MQTT `startCapture` → **640×480 H.264 over STUN** ✔
+- Camera (KVS, older printers): order 1001 → KVS channel ARN → viewer WSS → SigV4 presign → MQTT `startCapture` → **640×480 H.264 over STUN** ✔
+- Camera (Agora, newer firmware): implemented in v0.8.3 with the corrected order-1001 shape; end-to-end verification was pending because the test printer was offline during development.
 
 ---
 

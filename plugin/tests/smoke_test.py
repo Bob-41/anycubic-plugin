@@ -9,6 +9,7 @@ Set ANYCUBIC_PLUGIN_PATH to test a packaged artifact instead:
 """
 
 import atexit
+import base64
 import importlib.util
 import json
 import os
@@ -85,6 +86,8 @@ def main():
     network_http = orca_stub.permissions[0].get("network_http", [])
     assert "https://kinesisvideo.us-east-2.amazonaws.com" in network_http, \
         "KVS control-plane host must be granted for the camera"
+    assert "https://webrtc2-ap-web-1.agora.io" in network_http, \
+        "Agora access-point host must be granted for the camera"
     log_dir = module._anycubic_log_dir()
     if log_dir:
         assert log_dir in fs_read, \
@@ -704,17 +707,18 @@ def main():
     saved_token = module.STATE.workbench_token
     saved_printer = module.STATE.printer
     order_calls = []
+    order_response = {"code": 1, "data": {
+        "msgid": "camera-msgid",
+        "token": {
+            "region": "us-east-2", "tmpSecretId": "AKIA-TEST",
+            "tmpSecretKey": "secret", "sessionToken": "session",
+        },
+    }}
 
     def fake_camera_order(method, path, body=None, token="", timeout=20):
         order_calls.append((method, path, body, token))
-        if body.get("order_id") == module.CAMERA_OPEN_ORDER:
-            return {"code": 1, "data": {
-                "msgid": "camera-msgid",
-                "token": {
-                    "region": "us-east-2", "tmpSecretId": "AKIA-TEST",
-                    "tmpSecretKey": "secret", "sessionToken": "session",
-                },
-            }}
+        if str(body.get("order_id")) == str(module.CAMERA_OPEN_ORDER):
+            return order_response
         return {"code": 1, "data": {}}
 
     module._http_json = fake_camera_order
@@ -725,9 +729,56 @@ def main():
     try:
         opened, error = module.camera_open()
         assert opened and not error, (opened, error)
+        assert opened["mode"] == "kvs", opened
         assert opened["credentials"]["access_key"] == "AKIA-TEST"
+        # The slicer sends order_id as a string and the top-level flag;
+        # without either the cloud refuses Agora with "Video service
+        # upgraded. Update the slicer to enable."
         assert order_calls[-1][2] == {
-            "order_id": module.CAMERA_OPEN_ORDER, "printer_id": 52074}
+            "order_id": "1001", "printer_id": 52074,
+            "shengwang_rtc_support": True,
+        }, order_calls[-1][2]
+
+        # Agora printers return data.shengwang instead of AWS credentials.
+        order_response = {"code": 1, "data": {
+            "msgid": "agora-msgid",
+            "shengwang": {
+                "appid": "agora-app",
+                "channel": "agora-channel",
+                "rtc_token": "agora-token",
+                "client_uid": 4242,
+                "encryption_mode": "AES_256_GCM2",
+                "encryption_key": "0123456789abcdef0123456789abcdef",
+                "encryption_kdf_salt": "c2FsdHNhbHRzYWx0c2FsdHNhbHRzYWx0c2FsdHNhbHQ=",
+                "event_id": "event-1",
+            },
+            "shengwang_device": {"uid": 9001},
+        }}
+        opened, error = module.camera_open()
+        assert opened and not error, (opened, error)
+        assert opened["mode"] == "agora", opened
+        assert opened["credentials"].client_uid == 4242
+        assert opened["credentials"].device_uid == 9001
+        assert opened["credentials"].web_encryption_mode == "aes-256-gcm2"
+        assert opened["credentials"].is_encrypted
+
+        # A camera already held by another Anycubic session answers
+        # "Operation successful" with no credential block at all.
+        order_response = {
+            "code": 1, "msg": "Operation successful",
+            "data": {"msgid": "empty"},
+        }
+        opened, error = module.camera_open()
+        assert not opened and "no camera credentials" in error.lower(), error
+
+        order_response = {
+            "code": 1,
+            "msg": "Video service upgraded. Update the slicer to enable.",
+            "data": None,
+        }
+        opened, error = module.camera_open()
+        assert not opened and "video service upgraded" in error.lower(), error
+
         ok, message = module.camera_close()
         assert ok, message
         assert order_calls[-1][2] == {
@@ -737,6 +788,347 @@ def main():
         module.STATE.workbench_token = saved_token
         module.STATE.printer = saved_printer
     print("camera orders: OK", [call[2]["order_id"] for call in order_calls])
+
+    # ---- Agora ("shengwang") camera signaling ----------------------------
+    # A browser offer with the H.264/RTX pair, feedback and one host
+    # candidate, mirroring what Chromium generates for the dashboard.
+    agora_offer = "\r\n".join([
+        "v=0",
+        "o=- 4611731400430051336 2 IN IP4 127.0.0.1",
+        "s=-",
+        "t=0 0",
+        "a=group:BUNDLE 0",
+        "a=extmap-allow-mixed",
+        "a=msid-semantic: WMS",
+        "m=video 9 UDP/TLS/RTP/SAVPF 96 97",
+        "c=IN IP4 0.0.0.0",
+        "a=rtcp:9 IN IP4 0.0.0.0",
+        "a=ice-ufrag:F7gI",
+        "a=ice-pwd:x+xNhQ8Q9k1Cp0kFqPXpMlSw",
+        "a=ice-options:trickle",
+        "a=fingerprint:sha-256 D2:FA:0E:C3:22:59:5E:14:95:69:92:3D:13:B4:"
+        "84:24:2C:C2:A2:C0:3E:FD:34:8E:5F:C2:BE:B9:36:97:B0:B4",
+        "a=setup:actpass",
+        "a=mid:0",
+        "a=extmap:1 urn:ietf:params:rtp-hdrext:toffset",
+        "a=extmap:3 urn:3gpp:video-orientation",
+        "a=recvonly",
+        "a=rtcp-mux",
+        "a=rtcp-rsize",
+        "a=rtpmap:96 H264/90000",
+        "a=rtcp-fb:96 nack",
+        "a=rtcp-fb:96 nack pli",
+        "a=rtcp-fb:96 goog-remb",
+        "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;"
+        "profile-level-id=42e01f",
+        "a=rtpmap:97 rtx/90000",
+        "a=fmtp:97 apt=96",
+        "a=candidate:1 1 udp 2130706431 192.168.1.10 54321 typ host "
+        "generation 0",
+        "",
+    ])
+
+    parsed_offer = module._sdp_parse_offer(agora_offer)
+    assert parsed_offer["ice_ufrag"] == "F7gI", parsed_offer
+    assert parsed_offer["bundle_mids"] == "0", parsed_offer
+    assert parsed_offer["extmap_allow_mixed"] is True
+    assert [item["extensionName"]
+            for item in parsed_offer["video_extensions"]] == [
+        "urn:ietf:params:rtp-hdrext:toffset",
+        "urn:3gpp:video-orientation",
+    ], parsed_offer["video_extensions"]
+
+    offer_ortc = module._sdp_offer_to_ortc(parsed_offer["parsed"])
+    assert offer_ortc["iceParameters"]["candidates"] == [{
+        "foundation": "1", "protocol": "udp", "priority": 2130706431,
+        "ip": "192.168.1.10", "port": 54321, "type": "host",
+    }], offer_ortc["iceParameters"]
+    assert offer_ortc["dtlsParameters"]["role"] == "client"
+    recv_codecs = offer_ortc["rtpCapabilities"]["recv"]["videoCodecs"]
+    assert {item["payloadType"] for item in recv_codecs} == {96, 97}
+    assert not offer_ortc["rtpCapabilities"]["send"]["videoCodecs"]
+
+    gateway_fingerprint = (
+        "35:28:40:20:80:F6:E0:11:E4:40:42:E8:7C:55:D4:34:18:F4:35:04:"
+        "F3:3F:1A:EB:66:7A:13:85:6A:33:D2:6B")
+    gateway_ortc = {
+        "iceParameters": {
+            "iceUfrag": "agoraUF",
+            "icePwd": "agoraPWDagoraPWDagoraPWD",
+            "candidates": [{
+                "foundation": "1", "protocol": "udp",
+                "priority": 2130706431, "ip": "98.98.143.194",
+                "port": 4701, "type": "host",
+            }],
+        },
+        "dtlsParameters": {
+            "fingerprints": [{
+                "hashFunction": "sha-256",
+                "fingerprint": gateway_fingerprint,
+            }],
+            "role": "server",
+        },
+        "rtpCapabilities": {
+            "sendrecv": {
+                "videoCodecs": [{
+                    "payloadType": 96,
+                    "rtpMap": {
+                        "encodingName": "H264", "clockRate": 90000,
+                        "encodingParameters": None,
+                    },
+                    "rtcpFeedbacks": [
+                        {"type": "nack", "parameter": None},
+                        {"type": "nack", "parameter": "pli"},
+                    ],
+                    "fmtp": {"parameters": {
+                        "packetization-mode": "1",
+                        "profile-level-id": "42e01f",
+                    }},
+                }, {
+                    "payloadType": 97,
+                    "rtpMap": {
+                        "encodingName": "rtx", "clockRate": 90000,
+                        "encodingParameters": None,
+                    },
+                    "rtcpFeedbacks": [],
+                    "fmtp": {"parameters": {"apt": "96"}},
+                }],
+                "videoExtensions": [
+                    {"entry": 1,
+                     "extensionName": "urn:ietf:params:rtp-hdrext:toffset"},
+                    {"entry": 9, "extensionName": "urn:not:offered"},
+                ],
+                "audioCodecs": [],
+                "audioExtensions": [],
+            },
+        },
+    }
+    answer = module._sdp_build_answer(
+        gateway_ortc, parsed_offer,
+        {"uid": 9001, "ssrc": 1234, "rtx_ssrc": 1235, "cname": "printer"},
+    )
+    for token in (
+        "a=ice-lite", "a=setup:active",
+        "a=fingerprint:sha-256 " + gateway_fingerprint,
+        "a=candidate:1 1 udp 2130706431 98.98.143.194 4701 typ host",
+        "a=mid:0", "a=sendonly", "a=rtpmap:96 H264/90000",
+        "a=rtcp-fb:96 nack pli", "a=ssrc-group:FID 1234 1235",
+        "a=extmap:1 urn:ietf:params:rtp-hdrext:toffset",
+    ):
+        assert token in answer, (token, answer)
+    assert "urn:not:offered" not in answer, answer
+    print("Agora SDP/ORTC answer: OK")
+
+    # Access-point parsing: code 0 blocks, positional DTLS fingerprints.
+    ap_payload = {
+        "opid": 123, "enter_ts": 456,
+        "detail": {"502": "107.155.14.132"},
+        "response_body": [{
+            "uri": 23,
+            "buffer": {
+                "code": 0, "cid": 9, "cname": "agora-channel",
+                "flag": 4096, "uid": 4242, "cert": "edge-ticket",
+                "detail": {"19": "sha-256 AA:BB;sha-256 CC:DD"},
+                "edges_services": [
+                    {"ip": "1.2.3.4", "port": 4701},
+                    {"ip": "5.6.7.8", "port": 4702},
+                ],
+            },
+        }],
+    }
+    ap_block = module._agora_parse_ap(ap_payload)
+    assert ap_block["flag"] == 4096 and ap_block["ticket"] == "edge-ticket"
+    assert ap_block["addresses"][0] == {
+        "ip": "1.2.3.4", "port": 4701, "ticket": "edge-ticket",
+        "fingerprint": "sha-256 AA:BB",
+    }, ap_block["addresses"][0]
+    assert ap_block["addresses"][1]["fingerprint"] == "sha-256 CC:DD"
+    try:
+        module._agora_parse_ap({"response_body": [
+            {"buffer": {"code": 2010005}}]})
+        raise AssertionError("a rejected AP block must raise")
+    except RuntimeError as exc:
+        assert "2010005" in str(exc), exc
+
+    agora_creds = module._agora_credentials({
+        "msgid": "agora-msgid",
+        "shengwang": {
+            "appid": "app", "channel": "agora-channel",
+            "rtc_token": "rtc-token", "client_uid": 4242,
+            "encryption_mode": "AES_256_GCM2",
+            "encryption_key": "0123456789abcdef0123456789abcdef",
+            "encryption_kdf_salt":
+                "c2FsdHNhbHRzYWx0c2FsdHNhbHRzYWx0c2FsdHNhbHQ=",
+            "event_id": "event-1",
+        },
+        "shengwang_device": {"uid": 9001},
+    }, 52074)
+    assert agora_creds.appid == "app"
+    assert agora_creds.client_uid == 4242
+    assert agora_creds.device_uid == 9001
+    assert agora_creds.web_encryption_mode == "aes-256-gcm2"
+    assert agora_creds.is_encrypted
+    assert module._agora_credentials({"token": {}}) is None
+    assert module._agora_wrap_key(
+        "0123456789abcdef0123456789abcdef")
+    assert len(base64.b64decode(module._agora_wrap_key(
+        "0123456789abcdef0123456789abcdef"))) == 128
+    try:
+        module._agora_validate_salt("not base64")
+        raise AssertionError("a bad KDF salt must be rejected")
+    except RuntimeError:
+        pass
+
+    join = module._agora_join_message(
+        agora_creds, ap_block, ap_block["addresses"][0],
+        offer_ortc, "session-id",
+    )
+    assert join["_type"] == "join_v3", join
+    joined = join["_message"]
+    assert joined["channel_name"] == "agora-channel"
+    assert joined["channel_key"] == "rtc-token"
+    assert joined["app_id"] == "app"
+    assert joined["ortc"]["iceParameters"]["candidates"]
+    assert joined["ap_response"]["ticket"] == "edge-ticket"
+    assert joined["aes_mode"] == "aes-256-gcm2"
+    assert joined["aes_encrypt"] is True
+    assert len(base64.b64decode(joined["aes_secret"])) == 128
+    assert joined["aes_salt"] == agora_creds.encryption_kdf_salt
+    print("Agora AP/join message: OK")
+
+    # Gateway events: announce -> subscribe, crypt error -> fail + close.
+    class _FakeAgoraPage:
+        def __init__(self):
+            self.posted = []
+
+        def post_message(self, payload):
+            self.posted.append(payload)
+
+    fake_agora_page = _FakeAgoraPage()
+    saved_generation = module._webcam_generation
+    saved_camera_close = module.camera_close
+    agora_closed = []
+    module._webcam_generation = 7
+    module.camera_close = lambda pid=None, timeout=20: (
+        agora_closed.append(pid) or (True, "closed"))
+    try:
+        agora_session = module.AgoraSession(
+            fake_agora_page, agora_creds, agora_offer, 7)
+        agora_session._handle_event({
+            "_type": "on_add_video_stream",
+            "_message": {
+                "uid": 9001, "ssrcId": 44, "rtxSsrcId": 45,
+                "video": True, "cname": "printer",
+            },
+        })
+        assert agora_session.streams[(9001, 44)]["ssrc"] == 44
+        sent = [item for item in fake_agora_page.posted
+                if item.get("type") == "webcam_agora_send"]
+        assert sent, fake_agora_page.posted
+        subscribe = json.loads(sent[0]["message"])
+        assert subscribe["_type"] == "subscribe", subscribe
+        assert subscribe["_message"]["stream_id"] == 9001, subscribe
+        assert subscribe["_message"]["ssrcId"] == 44, subscribe
+
+        agora_session._handle_event({
+            "_type": "on_remove_video_stream",
+            "_message": {"uid": 9001},
+        })
+        assert not agora_session.streams
+        agora_session._handle_event({
+            "_type": "on_crypt_error",
+            "_message": {"code": 2028},
+        })
+        errors = [item for item in fake_agora_page.posted
+                  if item.get("type") == "webcam"
+                  and item.get("state") == "error"]
+        assert errors, fake_agora_page.posted
+        assert "encryption" in errors[-1]["error"].lower()
+        assert agora_closed == [52074], agora_closed
+        assert agora_session.closed
+
+        # A superseded worker must not talk to the dashboard.
+        stale_page = _FakeAgoraPage()
+        stale = module.AgoraSession(
+            stale_page, agora_creds, agora_offer, 6)
+        stale._post({"type": "webcam", "state": "error"})
+        assert not stale_page.posted
+    finally:
+        module._webcam_generation = saved_generation
+        module.camera_close = saved_camera_close
+    print("Agora gateway events: OK")
+
+    # Full Agora orchestration without a network: the page relays a join
+    # reply and a stream announcement, and the worker must answer with SDP.
+    class _ScriptedAgoraPage:
+        def __init__(self):
+            self.posted = []
+            self.session = None
+
+        def post_message(self, payload):
+            self.posted.append(payload)
+            if payload.get("type") != "webcam_agora_join":
+                return
+            join = json.loads(payload["join"])
+            self.session.feed(json.dumps({
+                "_id": join["_id"],
+                "_result": "success",
+                "_message": {
+                    "ortc": gateway_ortc,
+                    "streams": [{
+                        "uid": 9001, "ssrcId": 44, "rtxSsrcId": 45,
+                        "video": True, "cname": "printer",
+                    }],
+                },
+            }))
+
+    scripted_page = _ScriptedAgoraPage()
+    saved_choose = module._agora_choose_server
+    saved_generation = module._webcam_generation
+    module._agora_choose_server = lambda creds: ap_block
+    module._webcam_generation = 7
+    agora_worker = module.AgoraSession(
+        scripted_page, agora_creds, agora_offer, 7)
+    scripted_page.session = agora_worker
+    try:
+        agora_worker.start()
+        answer_message = None
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            for item in scripted_page.posted:
+                if item.get("type") == "webcam_agora_answer":
+                    answer_message = item
+                    break
+            if answer_message:
+                break
+            time.sleep(0.02)
+        assert answer_message is not None, scripted_page.posted
+        assert answer_message["session"] == 7, answer_message
+        for token in (
+            "a=ice-lite", "a=setup:active", "a=ssrc:44",
+            "a=ssrc-group:FID 44 45", "a=mid:0",
+        ):
+            assert token in answer_message["sdp"], (
+                token, answer_message["sdp"])
+        stream_messages = [
+            json.loads(item["message"])
+            for item in scripted_page.posted
+            if item.get("type") == "webcam_agora_send"
+        ]
+        kinds = [item["_type"] for item in stream_messages]
+        assert "set_client_role" in kinds, kinds
+        assert "subscribe" in kinds, kinds
+        subscribe = next(item for item in stream_messages
+                         if item["_type"] == "subscribe")
+        assert subscribe["_message"]["stream_id"] == 9001, subscribe
+        assert subscribe["_message"]["ssrcId"] == 44, subscribe
+        assert agora_worker.answer_sent is True
+    finally:
+        agora_worker.stop()
+        agora_worker.join(timeout=3.0)
+        module._agora_choose_server = saved_choose
+        module._webcam_generation = saved_generation
+    print("Agora worker orchestration: OK")
 
     # MQTT video publish: exact topic and payload shape.
     class _FakeInfo:
@@ -874,7 +1266,87 @@ def main():
         module._webcam_in_flight = saved_in_flight
         module._webcam_generation = saved_generation
 
-    # Without monitoring, the camera refuses before any order is sent.
+    # Agora start/stop: the order itself opens the stream, so no MQTT video
+    # command and no KVS control-plane lookup may happen.
+    agora_service = _FakeCameraService()
+    saved_service = module.STATE.mqtt_service
+    saved_connected = module.STATE.mqtt_connected
+    saved_printer = module.STATE.printer
+    saved_camera_state = module.STATE.camera_state
+    saved_camera_error = module.STATE.camera_error
+    saved_camera_started = module.STATE.camera_started
+    saved_open = module.camera_open
+    saved_close = module.camera_close
+    saved_arn = module._kvs_channel_arn
+    saved_endpoint = module._kvs_wss_endpoint
+    saved_session = module._webcam_session
+    saved_in_flight = module._webcam_in_flight
+    saved_generation = module._webcam_generation
+    module.STATE.mqtt_service = agora_service
+    module.STATE.mqtt_connected = False
+    module.STATE.printer = {
+        "id": 52074, "name": "Test Kobra", "key": "camera-key",
+        "machine_type": 20021, "device_status": 1,
+    }
+    module.STATE.workbench_token = "smoke-token"
+    module.STATE.token_exp = int(time.time()) + 3600
+    module.STATE.camera_state = "idle"
+    module.STATE.camera_error = ""
+    module.STATE.camera_started = 0.0
+    agora_closed = []
+    agora_page = object()
+    module.camera_open = lambda pid=None: ({
+        "printer_id": 52074, "msgid": "agora-msgid", "mode": "agora",
+        "credentials": agora_creds,
+    }, "")
+    module.camera_close = lambda pid=None, timeout=20: (
+        agora_closed.append(pid) or (True, "closed"))
+
+    def kvs_must_not_run(*args, **kwargs):
+        raise AssertionError("KVS must not be used for an Agora camera")
+
+    module._kvs_channel_arn = kvs_must_not_run
+    module._kvs_wss_endpoint = kvs_must_not_run
+    module._webcam_session = None
+    module._webcam_in_flight = False
+    module._webcam_generation = 0
+    try:
+        ok, message, config = module.webcam_start(agora_page)
+        assert ok, message
+        assert config["mode"] == "agora", config
+        assert config["first_frame_timeout"] == 45000, config
+        assert module.STATE.camera_state == "connecting", \
+            module.STATE.camera_state
+        assert agora_service.published == [], agora_service.published
+        assert module._webcam_session["mode"] == "agora"
+        assert module._webcam_session["page"] is agora_page
+        assert module._webcam_session["credentials"] is agora_creds
+
+        ok, message = module.webcam_stop()
+        assert ok, message
+        assert agora_service.published == [], agora_service.published
+        assert agora_closed == [52074], agora_closed
+        assert module.STATE.camera_state == "idle", module.STATE.camera_state
+        assert module._webcam_session is None
+        print("Agora webcam start/stop: OK")
+    finally:
+        module.STATE.mqtt_service = saved_service
+        module.STATE.mqtt_connected = saved_connected
+        module.STATE.printer = saved_printer
+        module.STATE.camera_state = saved_camera_state
+        module.STATE.camera_error = saved_camera_error
+        module.STATE.camera_started = saved_camera_started
+        module.camera_open = saved_open
+        module.camera_close = saved_close
+        module._kvs_channel_arn = saved_arn
+        module._kvs_wss_endpoint = saved_endpoint
+        module._webcam_session = saved_session
+        module._webcam_in_flight = saved_in_flight
+        module._webcam_generation = saved_generation
+
+    # Without monitoring, the camera refuses before any order is sent. With
+    # monitoring but no MQTT socket, Agora still starts (no MQTT command is
+    # involved), while a legacy KVS camera refuses.
     saved_service = module.STATE.mqtt_service
     saved_camera_state = module.STATE.camera_state
     saved_session = module._webcam_session
@@ -884,6 +1356,21 @@ def main():
     saved_guard_token = module.STATE.workbench_token
     saved_guard_exp = module.STATE.token_exp
     saved_guard_connected = module.STATE.mqtt_connected
+    saved_guard_open = module.camera_open
+    saved_guard_close = module.camera_close
+    guard_mode = {"mode": "agora"}
+    guard_closed = []
+    module.camera_open = lambda pid=None: ({
+        "printer_id": 52074, "msgid": "guard-msgid",
+        "mode": guard_mode["mode"],
+        "credentials": (
+            object() if guard_mode["mode"] == "agora" else {
+                "region": "us-east-2", "access_key": "AKIA-TEST",
+                "secret_key": "secret", "session_token": "session",
+            }),
+    }, "")
+    module.camera_close = lambda pid=None, timeout=20: (
+        guard_closed.append(pid) or (True, "closed"))
     module.STATE.mqtt_service = type("S", (), {"running": True})()
     module.STATE.mqtt_connected = False
     module.STATE.printer = {
@@ -897,6 +1384,13 @@ def main():
     module._webcam_in_flight = False
     module._webcam_generation = 0
     try:
+        ok, message, config = module.webcam_start()
+        assert ok and config["mode"] == "agora", (ok, message, config)
+        assert module.STATE.camera_state == "connecting", \
+            module.STATE.camera_state
+        module.webcam_stop()
+
+        guard_mode["mode"] = "kvs"
         ok, message, config = module.webcam_start()
         assert not ok and config is None, (ok, message, config)
         assert "not connected" in message.lower(), message
@@ -914,6 +1408,8 @@ def main():
         module.STATE.token_exp = saved_guard_exp
         module.STATE.mqtt_connected = saved_guard_connected
         module.STATE.camera_state = saved_camera_state
+        module.camera_open = saved_guard_open
+        module.camera_close = saved_guard_close
         module._webcam_session = saved_session
         module._webcam_in_flight = saved_in_flight
         module._webcam_generation = saved_generation
@@ -935,9 +1431,10 @@ def main():
             time.sleep(0.02)
         return None
 
-    module.webcam_start = lambda: (
+    module.webcam_start = lambda page=None: (
         True, "opened",
         {
+            "mode": "kvs",
             "wss_url": "wss://example.invalid/?X-Amz-Signature=x",
             "ice_servers": [{"urls": "stun:stun.example:3478"}],
             "expires_in": 299,
@@ -945,13 +1442,39 @@ def main():
     )
     stopped = []
     module.webcam_stop = lambda: (stopped.append(True) or (True, "stopped"))
+    saved_offer_fn = module.webcam_agora_offer
+    saved_feed_fn = module.webcam_agora_feed
     try:
         cam_page.on_message({"type": "webcam_start"})
         ready = cam_wait("webcam", lambda m: m.get("state") == "ready",
                          timeout=5.0)
         assert ready is not None, "webcam_start did not post a viewer config"
+        assert ready["mode"] == "kvs", ready
         assert ready["wss_url"].startswith("wss://example.invalid"), ready
         assert ready["ice_servers"], ready
+
+        # Agora only sends the mode; the page creates the offer.
+        module.webcam_start = lambda page=None: (
+            True, "opened",
+            {"mode": "agora", "first_frame_timeout": 45000},
+        )
+        cam_page._posted_local = []
+        cam_page.on_message({"type": "webcam_start"})
+        ready = cam_wait("webcam", lambda m: m.get("state") == "ready",
+                         timeout=5.0)
+        assert ready is not None, "Agora start did not post a viewer config"
+        assert ready["mode"] == "agora", ready
+        assert "wss_url" not in ready, ready
+
+        offers = []
+        frames = []
+        module.webcam_agora_offer = lambda sdp: (
+            offers.append(sdp) or (True, "started"))
+        module.webcam_agora_feed = lambda data: frames.append(data)
+        cam_page.on_message({"type": "webcam_agora_offer", "sdp": "v=0"})
+        cam_page.on_message({"type": "webcam_agora_frame", "data": "{}"})
+        assert offers == ["v=0"], offers
+        assert frames == ["{}"], frames
 
         module.STATE.camera_state = "connecting"
         cam_page.on_message({"type": "webcam_viewing"})
@@ -966,6 +1489,8 @@ def main():
     finally:
         module.webcam_start = saved_start_fn
         module.webcam_stop = saved_stop_fn
+        module.webcam_agora_offer = saved_offer_fn
+        module.webcam_agora_feed = saved_feed_fn
         module.STATE.camera_state = saved_page_camera_state
 
     ui = cam_page.get_ui()
@@ -978,6 +1503,9 @@ def main():
     for token in (
         "RTCPeerConnection", "setCodecPreferences", "video/h264",
         "SDP_OFFER", "ICE_CANDIDATE", "ice_servers",
+        "camConnectAgora", "webcam_agora_offer", "webcam_agora_frame",
+        "webcam_agora_join", "webcam_agora_answer", "webcam_agora_send",
+        "_type: \"ping\"",
     ):
         assert token in ui, "missing camera JavaScript token %s" % token
     assert module.KVS_STUN_SERVERS
