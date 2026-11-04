@@ -88,6 +88,21 @@ def main():
         "KVS control-plane host must be granted for the camera"
     assert "https://webrtc2-ap-web-1.agora.io" in network_http, \
         "Agora access-point host must be granted for the camera"
+    assert "('mqtt-universe.anycubic.com', 8883)" in orca_stub.permissions[0]["network_socket"], \
+        "MQTT host must be granted for monitoring"
+    # Orca collapses every request_permissions() call into one dialog, so a
+    # long list makes the window taller than some screens. Canonical
+    # https://host entries cover HTTP and raw sockets on every port; do not
+    # reintroduce the legacy host/port/tuple duplicates.
+    assert all(entry.startswith("https://") for entry in network_http), network_http
+    assert len(set(network_http)) == len(network_http), network_http
+    assert orca_stub.permissions[0]["network_socket"] == [
+        "('', 0)", "('mqtt-universe.anycubic.com', 8883)"], \
+        orca_stub.permissions[0]["network_socket"]
+    prompt_lines = len(fs_read) + len(network_http) + len(
+        orca_stub.permissions[0]["network_socket"])
+    assert prompt_lines <= 30, "permission dialog would be %d lines" % prompt_lines
+    print("permission prompt size: %d lines" % prompt_lines)
     log_dir = module._anycubic_log_dir()
     if log_dir:
         assert log_dir in fs_read, \

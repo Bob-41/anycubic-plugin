@@ -28,6 +28,7 @@ This plugin adds a **native dashboard** inside OrcaSlicer for managing Anycubic 
   - Filesystem read: `~/Downloads`, `~/Desktop`, `~/Documents`
   - Network: `cloud-universe.anycubic.com`, S3, **`kinesisvideo.*.amazonaws.com`**, **`webrtc2-ap-web-*.agora.io`** / **`webrtc2-*.ap.sd-rtn.com`** (for camera)
   - MQTT socket: `mqtt-universe.anycubic.com:8883`
+- OrcaSlicer combines these grants into one confirmation when the plugin is first enabled.
 
 ---
 

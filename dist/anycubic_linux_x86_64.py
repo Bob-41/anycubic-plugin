@@ -233,20 +233,14 @@ CAMERA_FIRST_FRAME_TIMEOUT = 20.0
 # uses. (The r-*.kinesisvideo ICE host and v-*.kinesisvideo WSS host are
 # discovered at runtime; the WSS connection is made by the dashboard WebView,
 # and the plugin uses public STUN instead of the dynamic ICE endpoint.)
-KVS_HTTP_PERMISSIONS = []
-KVS_SOCKET_PERMISSIONS = []
-for _kvs_region in KVS_REGIONS:
-    _kvs_host = "kinesisvideo.%s.amazonaws.com" % _kvs_region
-    KVS_HTTP_PERMISSIONS.extend([
-        "https://" + _kvs_host,
-        _kvs_host,
-        _kvs_host + ":443",
-        "('%s', 443)" % _kvs_host,
-    ])
-    KVS_SOCKET_PERMISSIONS.extend([
-        "('%s', 443)" % _kvs_host,
-        _kvs_host + ":443",
-    ])
+# Orca canonicalizes every network URL to scheme://host. That grant covers
+# every path, query and port on the host and also authorizes raw socket events
+# for it, so one entry per host is enough. The old bare-host, :port and
+# ("host", port) variants are only needed by older Orca builds and made the
+# single permission dialog overflow small screens.
+KVS_HTTP_PERMISSIONS = [
+    "https://kinesisvideo.%s.amazonaws.com" % region for region in KVS_REGIONS
+]
 
 
 # --- Agora ("shengwang") camera ---------------------------------------------
@@ -289,19 +283,9 @@ AGORA_PUBLIC_KEY_B64 = (
     "HvYl3iI1Yd4vl2c3qRMJPLtRDfNxa2Mcxgq7e9aEUibzdd0st+OJAy3tOj/Y0aVy"
     "xQiYDz3vqa6bP29adwIDAQAB"
 )
-AGORA_AP_HTTP_PERMISSIONS = []
-AGORA_AP_SOCKET_PERMISSIONS = []
-for _agora_host in AGORA_AP_DOMAINS + AGORA_AP_BACKUPS:
-    AGORA_AP_HTTP_PERMISSIONS.extend([
-        "https://" + _agora_host,
-        _agora_host,
-        _agora_host + ":443",
-        "('%s', 443)" % _agora_host,
-    ])
-    AGORA_AP_SOCKET_PERMISSIONS.extend([
-        "('%s', 443)" % _agora_host,
-        _agora_host + ":443",
-    ])
+AGORA_AP_HTTP_PERMISSIONS = [
+    "https://" + host for host in AGORA_AP_DOMAINS + AGORA_AP_BACKUPS
+]
 
 
 # ============================================================================
@@ -5919,18 +5903,16 @@ class AnycubicCloudPlugin(orca.base):
             fs_read=fs_read,
             network_http=[
                 "https://cloud-universe.anycubic.com",
-                "cloud-universe.anycubic.com",
-                "cloud-universe.anycubic.com:443",
-                "('cloud-universe.anycubic.com', 443)",
                 "https://workbentch.s3.us-east-2.amazonaws.com",
                 "https://workbench.s3.us-east-2.amazonaws.com",
             ] + KVS_HTTP_PERMISSIONS + AGORA_AP_HTTP_PERMISSIONS,
+            # Canonical https://host grants already cover raw sockets to these
+            # hosts on every port. The MQTT tuple is kept because earlier
+            # releases already persisted it, so upgrading does not ask again.
             network_socket=[
                 "('', 0)",
                 "('mqtt-universe.anycubic.com', 8883)",
-                "mqtt-universe.anycubic.com:8883",
-                "('cloud-universe.anycubic.com', 443)",
-            ] + KVS_SOCKET_PERMISSIONS + AGORA_AP_SOCKET_PERMISSIONS,
+            ],
             threading=True,
         )
         orca.register_capability(AnycubicCloudPage)
