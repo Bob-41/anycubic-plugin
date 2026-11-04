@@ -48,6 +48,7 @@ This plugin adds a **native dashboard** inside OrcaSlicer for managing Anycubic 
 | Action | How |
 |--------|-----|
 | Upload & print | Dashboard → **Print from folder** → pick file → **Upload & start print** (confirm) |
+| Change watch folder | Dashboard → **Print from folder** → **Change folder** (or the plugin's **Config** tab). Folders must be inside `~/Downloads`, `~/Desktop` or `~/Documents`. |
 | Pause / Resume / Stop | Dashboard → **Current job** → buttons (confirmation required) |
 | Webcam | Dashboard → **Camera** → **Start camera** → live view appears. **Stop camera** when done. |
 

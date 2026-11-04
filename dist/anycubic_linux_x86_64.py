@@ -2481,6 +2481,32 @@ def _inside_watch_roots(path):
         return False
 
 
+def _normalize_watch_dir(value):
+    """Return ``(path, error)`` for a folder typed into the UI.
+
+    This is pure string manipulation so it is safe on the UI thread. The
+    watcher thread still checks that the folder exists and resolves inside the
+    allowed roots before reading it.
+    """
+    raw = str(value if value is not None else "").strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+        raw = raw[1:-1].strip()
+    if not raw:
+        return DEFAULT_WATCH_DIR, ""
+    try:
+        path = os.path.normpath(os.path.expanduser(raw))
+    except Exception:
+        return "", "That folder path could not be understood."
+    if not os.path.isabs(path):
+        return path, ("Enter a full folder path, for example ~/Downloads or "
+                      "/Users/you/Desktop/models.")
+    if not _inside_watch_roots(path):
+        return path, ("The watch folder must be inside Downloads, Desktop or "
+                      "Documents, because those are the folders the plugin is "
+                      "allowed to read.")
+    return path, ""
+
+
 def watch_dir_status():
     """Return the configured watch folder without touching the filesystem.
 
@@ -2490,16 +2516,11 @@ def watch_dir_status():
     """
     with STATE.lock:
         raw = STATE.watch_dir or DEFAULT_WATCH_DIR
-    try:
-        path = os.path.normpath(os.path.expanduser(str(raw)))
-    except Exception:
-        path = DEFAULT_WATCH_DIR
-
-    if not _inside_watch_roots(path):
+    path, error = _normalize_watch_dir(raw)
+    if error:
         return {
-            "path": path,
-            "error": "The watch folder must be inside Downloads, Desktop or Documents, "
-                     "because those are the folders the plugin is allowed to read.",
+            "path": path or str(raw),
+            "error": error,
             "allowed": list(WATCH_ROOTS),
         }
     return {"path": path, "error": "", "allowed": list(WATCH_ROOTS)}
@@ -3826,6 +3847,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   button.danger-solid { background: #e53935; border-color: #e53935; color: #fff; }
   button.danger-solid:disabled { opacity: .5; }
   button:disabled { opacity: .5; cursor: default; }
+  input[type=text] { flex: 1; min-width: 220px; padding: 7px 10px; border-radius: 7px;
+                     border: 1px solid var(--orca-border, #d5d5d5); background: var(--orca-bg, #fff);
+                     color: var(--orca-fg, #222); font-family: ui-monospace, monospace; font-size: 12px; }
+  #watchEditError { margin-top: 6px; color: #c62828; font-size: 12px; display: none; }
   .bar { height: 10px; border-radius: 5px; background: var(--orca-border, #e8e8e8); overflow: hidden; margin-top: 8px; }
   .bar > div { height: 100%; width: 0%; background: var(--orca-accent, #009688); transition: width .3s ease; }
   .file { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--orca-border, #eee); }
@@ -3955,7 +3980,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="muted" id="watchHint">Newest .gcode files in the watch folder.</div>
       </div>
       <div class="spacer"></div>
+      <button id="btnWatchEdit">Change folder</button>
       <button id="btnRefreshFiles">Refresh</button>
+    </div>
+    <div id="watchEdit" style="display:none; margin-top:10px">
+      <div class="row">
+        <input id="watchPath" type="text" spellcheck="false" placeholder="~/Downloads">
+        <button id="watchSave" class="primary">Save</button>
+        <button id="watchCancel">Cancel</button>
+      </div>
+      <div class="row" id="watchRoots" style="margin-top:8px"></div>
+      <div class="muted" style="margin-top:8px">
+        Enter a folder inside Downloads, Desktop or Documents. Leave it empty
+        to use the default folder.
+      </div>
+      <div id="watchEditError"></div>
     </div>
     <div id="fileList" style="margin-top:8px"><div class="muted">Loading files…</div></div>
 
@@ -4001,6 +4040,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   var lastStatus = null;
   var fileRows = [];
   var filesSig = null;
+  var watchAllowed = [];
   var pending = null;
   var pendingControl = null;
   var currentUpload = null;
@@ -4125,8 +4165,50 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     pendingControl = null;
     $("controlConfirm").style.display = "none";
   }
+  function watchRootName(path) {
+    var parts = String(path || "").split(/[\\\\/]/).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : String(path || "");
+  }
+  function showWatchEditor() {
+    var d = lastStatus || {};
+    var watch = d.watch || {};
+    $("watchEdit").style.display = "block";
+    $("watchPath").value = watch.dir || "";
+    $("watchEditError").style.display = "none";
+    $("watchEditError").textContent = "";
+    $("watchSave").disabled = false;
+    var roots = $("watchRoots");
+    roots.innerHTML = "";
+    watchAllowed.forEach(function (path) {
+      var button = document.createElement("button");
+      button.textContent = watchRootName(path);
+      button.title = path;
+      button.onclick = function () {
+        $("watchPath").value = path;
+        $("watchPath").focus();
+      };
+      roots.appendChild(button);
+    });
+    $("watchPath").focus();
+  }
+  function hideWatchEditor() {
+    $("watchEdit").style.display = "none";
+    $("watchEditError").style.display = "none";
+    $("watchEditError").textContent = "";
+    $("watchSave").disabled = false;
+  }
+  function saveWatchDir() {
+    var path = ($("watchPath").value || "").trim();
+    $("watchEditError").style.display = "none";
+    $("watchEditError").textContent = "";
+    $("watchSave").disabled = true;
+    B.postMessage({ type: "set_watch_dir", path: path });
+  }
   function renderFiles(watch) {
     watch = watch || {};
+    if (watch.allowed && watch.allowed.length) {
+      watchAllowed = watch.allowed.slice();
+    }
     var dir = watch.dir || "";
     var scanning = !!watch.scanning;
     var stalled = !!watch.stalled;
@@ -4735,9 +4817,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     if (d && d.type === "files") {
       renderFiles({
-        dir: d.dir, files: d.items, error: d.error,
+        dir: d.dir, files: d.items, error: d.error, allowed: d.allowed,
         scanning: d.scanning, stalled: d.stalled, scan_age: d.scan_age
       });
+      return;
+    }
+    if (d && d.type === "watch_config") {
+      $("watchSave").disabled = false;
+      if (d.ok) {
+        hideWatchEditor();
+      } else {
+        $("watchEditError").textContent = d.message || "Could not change the watch folder.";
+        $("watchEditError").style.display = "block";
+      }
       return;
     }
     if (d && d.type === "upload") {
@@ -4840,6 +4932,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     $("watchHint").style.color = "";
     $("btnRefreshFiles").disabled = true;
     B.postMessage({ type: "refresh_files" });
+  };
+  $("btnWatchEdit").onclick = showWatchEditor;
+  $("watchCancel").onclick = hideWatchEditor;
+  $("watchSave").onclick = saveWatchDir;
+  $("watchPath").onkeydown = function (ev) {
+    if (ev.key === "Enter") saveWatchDir();
+    else if (ev.key === "Escape") hideWatchEditor();
   };
   $("confirmCancel").onclick = hideConfirm;
   $("confirmGo").onclick = function () {
@@ -5226,6 +5325,10 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
             self._post_files(force=True)
             return
 
+        if kind == "set_watch_dir":
+            self._set_watch_dir(data.get("path") or "")
+            return
+
         if kind == "upload":
             self._upload_async(data.get("path") or "", bool(data.get("start")))
             return
@@ -5390,6 +5493,7 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
                 "items": items,
                 "dir": watch["path"],
                 "error": error,
+                "allowed": watch["allowed"],
                 "scanning": watch["scanning"],
                 "stalled": watch["stalled"],
                 "status": watch["status"],
@@ -5515,6 +5619,50 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
             self.post_message(build_status())
         except Exception:
             pass
+
+    def _set_watch_dir(self, value):
+        """Validate, persist and activate a folder chosen in the dashboard."""
+        path, error = _normalize_watch_dir(value)
+        if error:
+            ok, message = False, error
+        else:
+            try:
+                raw = self.get_config()
+                if isinstance(raw, dict):
+                    config = dict(raw)
+                else:
+                    config = json.loads(raw or "{}")
+                    if not isinstance(config, dict):
+                        config = {}
+            except Exception:
+                config = {}
+            config["watch_dir"] = path
+            try:
+                self.save_config(json.dumps(config))
+            except Exception as exc:
+                ok, message = False, "Could not save the watch folder: %s" % exc
+            else:
+                with STATE.lock:
+                    changed = STATE.watch_dir != path
+                    STATE.watch_dir = path
+                STATE.save()
+                request_watch_refresh(force=True)
+                ok = True
+                message = (
+                    "Watch folder changed to %s." % path if changed
+                    else "The watch folder is already %s." % path)
+
+        STATE.set_notice(message, error=not ok)
+        try:
+            self.post_message({
+                "type": "watch_config",
+                "ok": ok,
+                "message": message,
+                "path": path,
+            })
+        except Exception:
+            pass
+        self._post_status()
 
     def _sync_config_token(self):
         """Keep the Config tab in step with the cached session, and exchange a token if signed out."""

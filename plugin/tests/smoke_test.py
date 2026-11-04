@@ -196,7 +196,7 @@ def main():
     for key in ("login", "printer", "mqtt", "temps", "print", "raw",
                 "printing", "watch", "upload", "job"):
         assert key in status, "missing status key %r" % key
-    for key in ("scanning", "stalled", "status", "scan_age", "files", "dir"):
+    for key in ("scanning", "stalled", "status", "scan_age", "files", "dir", "allowed"):
         assert key in status["watch"], "missing watch key %r" % key
     print("poll status: OK")
     print(json.dumps(status, indent=2)[:1200])
@@ -226,6 +226,7 @@ def main():
     saved_roots = module.WATCH_ROOTS
     saved_default = module.DEFAULT_WATCH_DIR
     saved_watch = module.STATE.watch_dir
+    saved_page_config = page.get_config()
     module.WATCH_ROOTS = (watch_root,)
     module.DEFAULT_WATCH_DIR = watch_root
     module.STATE.watch_dir = watch_root
@@ -243,7 +244,57 @@ def main():
         files_msg = wait_for("files")
         assert files_msg is not None, "refresh_files did not post a file list"
         assert files_msg["dir"] == watch_root and files_msg["items"][0]["name"] == "part.gcode"
+        assert watch_root in files_msg["allowed"], files_msg
         print("file list message: OK")
+
+        # The dashboard can change the watch folder. The choice must be
+        # validated, persisted to both state.json and Orca's config, and the
+        # watcher must rescan the new folder.
+        nested = os.path.join(watch_root, "nested")
+        os.makedirs(nested)
+        with open(os.path.join(nested, "nested.gcode"), "w", encoding="utf-8") as fh:
+            fh.write("; nested\nG28\n")
+        refreshes = []
+        saved_refresh = module.request_watch_refresh
+        module.request_watch_refresh = lambda force=False: refreshes.append(force)
+        try:
+            page.on_message({"type": "set_watch_dir", "path": '"%s"' % nested})
+            changed = wait_for("watch_config", timeout=3.0)
+            assert changed is not None and changed["ok"] is True, changed
+            assert changed["path"] == nested, changed
+        finally:
+            module.request_watch_refresh = saved_refresh
+        assert refreshes == [True], refreshes
+        assert module.STATE.watch_dir == nested, module.STATE.watch_dir
+        assert json.loads(page.get_config())["watch_dir"] == nested, page.get_config()
+        with open(module.STATE_PATH, "r", encoding="utf-8") as fh:
+            persisted = json.load(fh)
+        assert persisted["watch_dir"] == nested, persisted
+        items, err = module.watch_files(force=True)
+        assert err == "", err
+        assert [item["name"] for item in items] == ["nested.gcode"], items
+        print("change watch folder: OK", nested)
+
+        saved_config = page.get_config()
+        page.on_message({"type": "set_watch_dir", "path": "/etc"})
+        rejected = wait_for(
+            "watch_config", lambda m: m.get("ok") is False, timeout=3.0)
+        assert rejected is not None, "folder outside the allowed roots was accepted"
+        assert "Downloads, Desktop or Documents" in rejected["message"], rejected
+        assert module.STATE.watch_dir == nested, module.STATE.watch_dir
+        assert page.get_config() == saved_config, "invalid folder changed the config"
+        print("watch folder validation: OK")
+
+        # Restore the original folder for the remaining checks.
+        page.save_config(saved_page_config)
+        page.on_message({"type": "set_watch_dir", "path": watch_root})
+        restored = wait_for(
+            "watch_config",
+            lambda m: m.get("ok") is True and m.get("path") == watch_root,
+            timeout=3.0)
+        assert restored is not None, "watch folder was not restored"
+        module.watch_files(force=True)
+        assert json.loads(page.get_config())["watch_dir"] == watch_root
 
         # build_status() runs on the UI thread and must never enumerate a
         # directory. With background scanning enabled it only copies the cache.
@@ -447,6 +498,10 @@ def main():
         module.WATCH_ROOTS = saved_roots
         module.DEFAULT_WATCH_DIR = saved_default
         module.STATE.watch_dir = saved_watch
+        try:
+            page.save_config(saved_page_config)
+        except Exception:
+            pass
         reset_watch()
         module.WATCH_BACKGROUND = saved_watch_background
     print("watch/upload/start print: OK")
