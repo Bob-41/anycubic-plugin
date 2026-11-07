@@ -404,6 +404,7 @@ def _signature(ts: str, nonce: str, version: str = XX_VERSION) -> str:
 def _http_json(method: str, path: str, body=None, token: str = "", timeout: int = 20):
     """Perform a signed Anycubic cloud API request, return parsed JSON dict."""
     from urllib import request as urlrequest
+    from urllib import error as urlerror
 
     ts = str(int(_now() * 1000))
     nonce = uuid.uuid4().hex
@@ -433,8 +434,12 @@ def _http_json(method: str, path: str, body=None, token: str = "", timeout: int 
         headers=headers,
         method=method,
     )
-    with urlrequest.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", "replace")
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urlerror.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", "replace") if exc.fp else ""
+        raise RuntimeError("HTTP %s %s: %s" % (exc.code, exc.reason, body_text))
     return json.loads(raw)
 
 
