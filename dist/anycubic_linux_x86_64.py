@@ -413,6 +413,7 @@ def _http_json(method: str, path: str, body=None, token: str = "", timeout: int 
         "Accept-Encoding": "identity",
         "Content-Type": "application/json; charset=UTF-8" if method != "GET"
         else "application/x-www-form-urlencoded",
+        "User-Agent": "AnycubicSlicerNext/2.5.8.6 (pcf; anycubic-cloud-plugin)",
         "XX-Device-Type": DEVICE_TYPE,
         "XX-IS-CN": IS_CN,
         "XX-LANGUAGE": LANGUAGE,
