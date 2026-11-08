@@ -846,6 +846,14 @@ def main():
         assert "function duration(" in page.get_ui()
         assert "p.total_layers" in page.get_ui()
         print("dashboard layer/remaining wiring: OK")
+
+        # The dashboard is centred: the content column is auto-margined and
+        # every flex row packs its items around the middle.
+        ui = page.get_ui()
+        assert ".wrap { padding: 18px; max-width: 980px; margin: 0 auto; }" in ui
+        assert "flex-wrap: wrap; justify-content: center;" in ui
+        assert "text-align: center;" in ui
+        print("dashboard centred layout: OK")
     finally:
         module.STATE.status_payload = saved_status_payload
         module.STATE.print_payload = saved_print_payload
