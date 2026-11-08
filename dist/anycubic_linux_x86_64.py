@@ -6,7 +6,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.8.8"
+# version = "0.8.9"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -150,7 +150,7 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.8.8"
+PLUGIN_VERSION = "0.8.9"
 
 # G-code files are read from a local folder. The host grants file-read access
 # per directory tree, so keep the allowed roots to the usual export folders.
@@ -3964,10 +3964,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <style>
-  body { font-family: var(--orca-font, system-ui); margin: 0; color: var(--orca-fg, #222); background: var(--orca-bg, #fff); }
-  .wrap { padding: 18px; max-width: 980px; }
-  .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-  .spacer { flex: 1; }
+  body { font-family: var(--orca-font, system-ui); margin: 0; color: var(--orca-fg, #222); background: var(--orca-bg, #fff); text-align: center; }
+  .wrap { padding: 18px; max-width: 980px; margin: 0 auto; }
+  .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: center; }
+  .spacer { display: none; }
   h1 { font-size: 20px; margin: 0; }
   .muted { color: var(--orca-muted, #777); font-size: 13px; }
   .badge { padding: 3px 10px; border-radius: 11px; font-size: 12px; font-weight: 600; }
@@ -3975,7 +3975,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .badge.off { background: rgba(120,120,120,.15); color: var(--orca-muted, #777); }
   .badge.err { background: rgba(244,67,54,.15); color: #e53935; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 16px; }
-  .card { border: 1px solid var(--orca-border, #e3e3e3); border-radius: 10px; padding: 14px; background: var(--orca-bg, #fff); }
+  .card { border: 1px solid var(--orca-border, #e3e3e3); border-radius: 10px; padding: 14px; background: var(--orca-bg, #fff); text-align: center; }
   .value { font-size: 26px; font-weight: 650; }
   .label { font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--orca-muted, #777); margin-top: 4px; }
   .section { margin-top: 22px; font-size: 13px; font-weight: 650; text-transform: uppercase; letter-spacing: .05em; color: var(--orca-muted, #777); }
@@ -3985,15 +3985,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   button.danger-solid { background: #e53935; border-color: #e53935; color: #fff; }
   button.danger-solid:disabled { opacity: .5; }
   button:disabled { opacity: .5; cursor: default; }
-  input[type=text] { flex: 1; min-width: 220px; padding: 7px 10px; border-radius: 7px;
+  input[type=text] { flex: 1 1 320px; max-width: 520px; min-width: 220px; padding: 7px 10px; border-radius: 7px;
                      border: 1px solid var(--orca-border, #d5d5d5); background: var(--orca-bg, #fff);
-                     color: var(--orca-fg, #222); font-family: ui-monospace, monospace; font-size: 12px; }
+                     color: var(--orca-fg, #222); font-family: ui-monospace, monospace; font-size: 12px; text-align: center; }
   #watchEditError { margin-top: 6px; color: #c62828; font-size: 12px; display: none; }
   .bar { height: 10px; border-radius: 5px; background: var(--orca-border, #e8e8e8); overflow: hidden; margin-top: 8px; }
   .bar > div { height: 100%; width: 0%; background: var(--orca-accent, #009688); transition: width .3s ease; }
-  .file { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--orca-border, #eee); }
+  .file { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--orca-border, #eee); }
   .file:last-child { border-bottom: 0; }
-  .file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-name { flex: 0 1 auto; min-width: 0; max-width: 65%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .file-meta { color: var(--orca-muted, #777); font-size: 12px; white-space: nowrap; }
   .file button { padding: 5px 10px; font-size: 12px; }
   .confirm { margin-top: 12px; padding: 12px; border: 1px solid rgba(255,152,0,.55); border-radius: 8px;
@@ -4010,7 +4010,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   #notice.info { display: block; background: rgba(0,150,136,.1); color: #00796b; }
   #notice.error { display: block; background: rgba(244,67,54,.1); color: #c62828; }
   details { margin-top: 18px; }
-  pre { font-size: 11px; max-height: 220px; overflow: auto; background: var(--orca-border, #f5f5f5); padding: 10px; border-radius: 8px; }
+  pre { font-size: 11px; max-height: 220px; overflow: auto; background: var(--orca-border, #f5f5f5); padding: 10px; border-radius: 8px; text-align: left; }
 </style>
 </head>
 <body>
