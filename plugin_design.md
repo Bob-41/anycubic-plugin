@@ -74,6 +74,8 @@ G-code from the watched folder → `lockStorageSpace {size, name, is_temp_file:0
 
 ### 3.5 Staleness
 `status/report` is about every 300 s, so the UI must show "last updated N s ago" and mark data stale after about 2× the interval. Do not label F3 "live" in the UI.
+- **v0.8.8 live layer / remaining:** `print/report` is the live job stream, while `status/report` can still carry the cloud's older project snapshot. Job counters (`curr_layer`, `total_layers`, `print_time`, `remain_time`, `progress`, `filename`) are read from `print/report` first so a stale `curr_layer=0` / `remain_time=-1` heartbeat cannot mask the live values. Anycubic uses `-1` for "not reported"; those values are treated as missing rather than displayed.
+- When `total_layers` is missing, the watcher reads the first 128 KiB of the matching G-code in the watch folder and caches the header's `total layer number` / `layer num/total_layer_count` value. If the printer still reports `curr_layer=0` mid-print, the dashboard shows the layer estimated from progress (`~N / total`). When `remain_time=-1`, it estimates the countdown from the printer's elapsed `print_time` and progress. Both estimates are marked in the UI (tilde and tooltip) so they are not mistaken for printer-reported values.
 
 ### 3.5.1 Distribution (Orca Plugin Hub)
 - The hub installs one entry file per plugin (`.py` or `.whl`); sibling files are not copied. The upload artifact is `dist/anycubic_cloud_any.py`: a single-file PEP 723 plugin with the CA certificate and broker public key embedded as `CA_PEM` / `BROKER_PUB_PEM`.

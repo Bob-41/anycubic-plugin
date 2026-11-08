@@ -62,6 +62,7 @@ import hmac
 import json
 import os
 import queue
+import re
 import ssl
 import threading
 import time
@@ -2443,6 +2444,32 @@ def _progress_percent(payloads):
     return round(num, 1)
 
 
+def _metric_float(value, minimum=0.0):
+    """Parse a numeric metric; Anycubic uses -1 for "not reported"."""
+    num = _as_float(value)
+    if num is None or num < minimum:
+        return None
+    return num
+
+
+def _metric_int(value, minimum=0):
+    """Parse an integer metric, also accepting float-looking strings."""
+    num = _as_float(value)
+    if num is None or num < minimum:
+        return None
+    return int(num)
+
+
+def _gcode_key(name):
+    """Normalise a G-code name so cloud and local records can be matched."""
+    base = os.path.basename(str(name or "")).strip().lower()
+    for ext in WATCH_EXTENSIONS:
+        if base.endswith(ext):
+            base = base[:-len(ext)]
+            break
+    return base
+
+
 # ============================================================================
 # Watch folder (G-code source for upload)
 # ============================================================================
@@ -2550,6 +2577,57 @@ def _decorate_file(item, now):
     return item
 
 
+# OrcaSlicer, PrusaSlicer and Cura all put the layer total near the start of
+# the file. Only this header is read: scanning a 30 MB G-code every five
+# seconds just to count layers would make the watcher pointless.
+_GCODE_HEADER_BYTES = 131072
+_GCODE_LAYER_PATTERNS = (
+    re.compile(r"^;\s*total layer number\s*:\s*(\d+)", re.IGNORECASE),
+    re.compile(r"^;\s*total_layers?\s*[:=]\s*(\d+)", re.IGNORECASE),
+    re.compile(r"^;\s*layer_count\s*[:=]\s*(\d+)", re.IGNORECASE),
+    re.compile(r"^;\s*layer num/total_layer_count\s*:\s*\d+\s*/\s*(\d+)",
+               re.IGNORECASE),
+)
+_layer_count_cache = {}
+_layer_count_lock = threading.Lock()
+
+
+def _gcode_total_layers(path, mtime=0.0, size=0):
+    """Read a G-code header's total layer count, cached by file identity."""
+    try:
+        key = (os.path.realpath(path), round(float(mtime or 0), 3),
+               int(size or 0))
+    except Exception:
+        return None
+    with _layer_count_lock:
+        if key in _layer_count_cache:
+            return _layer_count_cache[key]
+
+    count = None
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(_GCODE_HEADER_BYTES).decode("utf-8", "replace")
+        for line in head.splitlines():
+            for pattern in _GCODE_LAYER_PATTERNS:
+                match = pattern.match(line)
+                if not match:
+                    continue
+                value = int(match.group(1))
+                if value > 0:
+                    count = value
+                    break
+            if count is not None:
+                break
+    except (OSError, ValueError):
+        count = None
+
+    with _layer_count_lock:
+        if len(_layer_count_cache) > 200:
+            _layer_count_cache.clear()
+        _layer_count_cache[key] = count
+    return count
+
+
 def _scan_watch_dir(status):
     """Enumerate the watch folder. Runs on the watcher thread only."""
     display = status["path"]
@@ -2576,11 +2654,14 @@ def _scan_watch_dir(status):
                     info = entry.stat(follow_symlinks=False)
                 except OSError:
                     continue
+                path = os.path.join(real, entry.name)
                 items.append({
                     "name": entry.name,
-                    "path": os.path.join(real, entry.name),
+                    "path": path,
                     "size": int(info.st_size),
                     "mtime": float(info.st_mtime),
+                    "layers": _gcode_total_layers(
+                        path, info.st_mtime, info.st_size),
                 })
     except Exception as exc:
         return real, [], "Could not read the watch folder: %s" % exc
@@ -3199,6 +3280,12 @@ def build_status():
         video_ts = STATE.video_ts
 
     payloads = [status_payload, print_payload]
+    # print/report is the printer's live job stream. status/report is a slower
+    # heartbeat and can still carry the cloud's older project snapshot, which
+    # on some firmware contains curr_layer=0, total_layers=-1 and remain_time=-1.
+    # Search print/report first for job counters so those sentinels cannot mask
+    # the live values; state and temperatures still read from both payloads.
+    job_payloads = [print_payload, status_payload]
     # Fall back to the temps the cloud recorded in the printer list, so the
     # dashboard is not empty before the first status/report arrives.
     parameter = printer.get("parameter")
@@ -3216,38 +3303,95 @@ def build_status():
     def one(keys, from_=None):
         return _find(from_ if from_ is not None else payloads, keys)
 
+    def job_one(keys):
+        # Payload order wins over key order here: a live print/report field
+        # must not lose to a differently named stale field in status/report.
+        for payload in job_payloads:
+            if payload is None:
+                continue
+            value = _find([payload], keys)
+            if value is not None:
+                return value
+        return None
+
     nozzle = _as_float(one(["curr_nozzle_temp", "nozzle_temp", "nozzle_temperature"], temp_payloads))
     nozzle_target = _as_float(one(["target_nozzle_temp", "nozzle_target_temp", "target_nozzle"], temp_payloads))
     bed = _as_float(one(["curr_hotbed_temp", "bed_temp", "hotbed_temp"], temp_payloads))
     bed_target = _as_float(one(["target_hotbed_temp", "bed_target_temp", "target_hotbed"], temp_payloads))
 
-    progress = _progress_percent(payloads)
-    layer = one(["curr_layer", "current_layer", "layer", "layer_num"])
+    progress = _progress_percent(job_payloads)
+    layer = _metric_int(
+        job_one(["curr_layer", "current_layer", "layer", "layer_num"]))
+    total_layers = _metric_int(
+        job_one(["total_layers", "total_layer", "layer_count", "layers_total"]),
+        minimum=1)
     print_state = one(["print_status", "state", "status", "device_status"])
-    filename = one(["filename", "file_name", "gcode_name", "task_name", "model"])
-    remaining = one(["remain_time", "remaining_time", "print_remain_time", "left_time"])
+    filename = job_one(["filename", "file_name", "gcode_name", "task_name", "model"])
+    remaining = _metric_float(
+        job_one(["remain_time", "remaining_time", "print_remain_time", "left_time"]))
+    elapsed = _metric_float(
+        job_one(["print_time", "elapsed_time", "printing_time"]))
 
     job_file = (project.get("gcode_name") or project.get("name")
                 or project.get("file_name") or "") if project else ""
-    job_progress = _as_float(project.get("progress")) if project else None
-    job_remaining = _as_float(project.get("remain_time")) if project else None
-    if job_remaining is None or job_remaining <= 0:
-        job_remaining = _as_float(job_settings.get("remain_time"))
-    if job_remaining is not None and job_remaining <= 0:
-        job_remaining = None
+    job_progress = _metric_float(project.get("progress")) if project else None
+    job_remaining = _metric_float(project.get("remain_time")) if project else None
+    if job_remaining is None:
+        job_remaining = _metric_float(job_settings.get("remain_time"))
+    job_layer = _metric_int(job_settings.get("curr_layer"))
+    job_total = _metric_int(job_settings.get("total_layers"), minimum=1)
+    job_elapsed = _metric_float(job_settings.get("print_time"))
 
-    # The HTTP project record fills gaps in the MQTT snapshot. MQTT values win
-    # when both are present because status/report is the printer's own view.
+    # The HTTP project record fills gaps in the MQTT snapshot.
     if progress is None and job_progress is not None:
         progress = round(job_progress, 1)
     if not filename and job_file:
         filename = job_file
-    if remaining is None and job_remaining is not None:
+    if remaining is None:
         remaining = job_remaining
-    if layer is None and project:
-        job_layer = _as_int(job_settings.get("curr_layer"))
-        if job_layer:
-            layer = job_layer
+    if layer is None:
+        layer = job_layer
+    if total_layers is None:
+        total_layers = job_total
+    if elapsed is None:
+        elapsed = job_elapsed
+
+    # The cloud project omits total_layers on firmware that does not report it.
+    # The file being printed usually sits in the watch folder, and its header
+    # carries the layer count, so recover it there without any UI-thread I/O.
+    if total_layers is None:
+        wanted = {_gcode_key(filename), _gcode_key(job_file)}
+        wanted.discard("")
+        if wanted:
+            for item in watch.get("files") or []:
+                if (_gcode_key(item.get("name")) in wanted
+                        and item.get("layers")):
+                    total_layers = int(item["layers"])
+                    break
+
+    # A printer that reports curr_layer=0 for the whole job still has a usable
+    # progress percentage. Estimate the layer from the confirmed layer count
+    # and mark it so the dashboard can show the value as approximate.
+    layer_estimated = False
+    if (total_layers and progress is not None and progress > 0
+            and (layer is None or layer <= 0)):
+        layer = max(1, min(total_layers, int(round(
+            total_layers * min(progress, 100.0) / 100.0))))
+        layer_estimated = True
+
+    # Firmware that reports remain_time=-1 still reports elapsed print_time and
+    # progress. Extrapolating from those two gives a usable countdown.
+    remaining_estimated = False
+    if (remaining is None and elapsed is not None and progress is not None
+            and printing):
+        if progress >= 100:
+            remaining = 0.0
+        elif progress > 0:
+            remaining = round(max(
+                0.0, elapsed * (100.0 - progress) / progress), 1)
+        if remaining is not None:
+            remaining_estimated = True
+
     if job_paused:
         print_state = "paused"
     elif print_state is None and job_status is not None:
@@ -3309,8 +3453,12 @@ def build_status():
             "state": print_state,
             "progress": progress,
             "layer": layer,
+            "total_layers": total_layers,
+            "layer_estimated": layer_estimated,
             "file": filename,
             "remaining": remaining,
+            "remaining_estimated": remaining_estimated,
+            "elapsed": elapsed,
         },
         "printing": printing,
         "job": {
@@ -3321,7 +3469,7 @@ def build_status():
             "paused": job_paused,
             "status": job_status,
             "progress": job_progress,
-            "remaining": job_remaining,
+            "remaining": remaining if remaining is not None else job_remaining,
             "age": project_age,
             "error": project_error,
             "busy": control_busy,
@@ -4059,6 +4207,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     if (sec < 90) return Math.round(sec) + "s ago";
     if (sec < 5400) return Math.round(sec / 60) + " min ago";
     return Math.round(sec / 3600) + " h ago";
+  }
+  function duration(minutes) {
+    if (minutes === null || minutes === undefined) return null;
+    var sec = Math.max(0, Math.round(minutes * 60));
+    if (sec <= 0) return "0 min";
+    if (sec < 60) return "<1 min";
+    var h = Math.floor(sec / 3600);
+    var m = Math.round((sec % 3600) / 60);
+    if (m === 60) { h += 1; m = 0; }
+    if (h) return h + "h" + (m ? " " + m + "m" : "");
+    return Math.max(1, m) + " min";
   }
   function uploadActive() {
     return !!(currentUpload && !currentUpload.done);
@@ -4884,10 +5043,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     var p = d.print || {};
     set("printState", p.state);
-    set("layer", p.layer);
+    var layerText = p.layer;
+    if (p.layer !== null && p.layer !== undefined && p.total_layers) {
+      layerText = (p.layer_estimated ? "~" : "") + p.layer + " / " + p.total_layers;
+    } else if (p.layer === 0 && p.progress > 0) {
+      // A zero layer mid-print is the firmware's "unknown", not layer zero.
+      layerText = null;
+    }
+    set("layer", layerText);
+    $("layer").title = p.layer_estimated
+      ? "Estimated from the print progress and the G-code layer count."
+      : "";
     set("progress", p.progress);
     set("file", p.file);
-    set("remaining", p.remaining);
+    set("remaining", duration(p.remaining));
+    $("remaining").title = p.remaining_estimated
+      ? "Estimated from the printer's elapsed print time and progress."
+      : "";
     $("bar").style.width = (p.progress === null || p.progress === undefined) ? "0%" :
       Math.max(0, Math.min(100, p.progress)) + "%";
 
