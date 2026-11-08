@@ -795,6 +795,29 @@ def main():
         assert printed["remaining_estimated"] is True, printed
         print("estimated layer/remaining fallback: OK", printed)
 
+        # With no total in either payload or the cloud project, the layer count
+        # comes from the matching file in the watch snapshot.
+        saved_snapshot = module.watch_snapshot
+        module.watch_snapshot = lambda: {
+            "path": "/tmp/watch", "error": "", "allowed": [],
+            "files": [{"name": "derive.gcode", "layers": 215}],
+            "scanning": False, "stalled": False, "status": "ready",
+            "scan_age": 1.0,
+        }
+        try:
+            module.STATE.project["settings"] = json.dumps({
+                "curr_layer": 0, "total_layers": -1,
+                "print_time": 60.0, "remain_time": -1,
+            })
+            status = module.build_status()
+            printed = status["print"]
+            assert printed["total_layers"] == 215, printed
+            assert printed["layer"] == 108, printed
+            assert printed["layer_estimated"] is True, printed
+        finally:
+            module.watch_snapshot = saved_snapshot
+        print("watch-folder layer count fallback: OK", printed)
+
         # The total layer count is recovered from the G-code header in the
         # watch folder, not by scanning the whole multi-megabyte file.
         layer_dir = tempfile.mkdtemp(prefix="anycubic-layers-")
