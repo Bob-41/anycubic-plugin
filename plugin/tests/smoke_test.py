@@ -97,7 +97,8 @@ def main():
     assert all(entry.startswith("https://") for entry in network_http), network_http
     assert len(set(network_http)) == len(network_http), network_http
     assert orca_stub.permissions[0]["network_socket"] == [
-        "('', 0)", "('mqtt-universe.anycubic.com', 8883)"], \
+        "('', 0)", "('mqtt-universe.anycubic.com', 8883)",
+        "('127.0.0.1', 5766)"], \
         orca_stub.permissions[0]["network_socket"]
     prompt_lines = len(fs_read) + len(network_http) + len(
         orca_stub.permissions[0]["network_socket"])
@@ -209,7 +210,7 @@ def main():
     status = posted[-1]
     assert status["type"] == "status"
     for key in ("login", "printer", "mqtt", "temps", "print", "raw",
-                "printing", "watch", "upload", "job"):
+                "printing", "watch", "upload", "job", "bridge"):
         assert key in status, "missing status key %r" % key
     for key in ("scanning", "stalled", "status", "scan_age", "files", "dir", "allowed"):
         assert key in status["watch"], "missing watch key %r" % key
@@ -520,6 +521,156 @@ def main():
         reset_watch()
         module.WATCH_BACKGROUND = saved_watch_background
     print("watch/upload/start print: OK")
+
+    # ---- localhost bridge (v0.9.0) ----------------------------------------
+    # OrcaSlicer's Octo/Klipper print host uploads to 127.0.0.1; the plugin
+    # forwards the same file to Anycubic Cloud and optionally starts it.
+    import urllib.error
+    import urllib.request
+
+    bridge_calls = []
+
+    def fake_bridge_upload(data, name, on_progress=None):
+        bridge_calls.append(("upload", name, data))
+        if on_progress:
+            on_progress("upload", 50)
+            on_progress("claim", 95)
+        return {"file_id": 9001, "name": name, "size": len(data)}
+
+    def fake_bridge_start(file_id, printer_id=None):
+        bridge_calls.append(("start", file_id))
+        return True, "Print started."
+
+    saved_upload_bytes = module.upload_gcode_bytes
+    saved_start_print = module.start_print
+    saved_preflight = module.print_preflight
+    module.upload_gcode_bytes = fake_bridge_upload
+    module.start_print = fake_bridge_start
+    module.print_preflight = lambda refresh=False: (True, "")
+
+    def bridge_request(url, method="GET", data=None, headers=None):
+        req = urllib.request.Request(
+            url, data=data, method=method, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def bridge_multipart(filename, content, start):
+        boundary = "----anycubic-bridge-smoke"
+        chunks = []
+        for field, value in (("print", "true" if start else "false"),
+                             ("path", "/tmp")):
+            chunks.append(("--" + boundary + "\r\n").encode())
+            chunks.append((
+                'Content-Disposition: form-data; name="%s"\r\n\r\n' % field
+            ).encode())
+            chunks.append(value.encode() + b"\r\n")
+        chunks.append(("--" + boundary + "\r\n").encode())
+        chunks.append((
+            'Content-Disposition: form-data; name="file"; filename="%s"\r\n'
+            % filename).encode())
+        chunks.append(b"Content-Type: application/octet-stream\r\n\r\n")
+        chunks.append(content + b"\r\n")
+        chunks.append(("--" + boundary + "--\r\n").encode())
+        return b"".join(chunks), "multipart/form-data; boundary=" + boundary
+
+    bridge = module.BridgeService()
+    try:
+        bridge.start(port=0)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not bridge.status()["running"]:
+            time.sleep(0.02)
+        assert bridge.status()["running"], bridge.status()
+        base = "http://127.0.0.1:%d" % bridge.status()["port"]
+        key = module.bridge_api_key()
+        assert key and len(key) >= 32, key
+
+        code, payload = bridge_request(
+            base + "/api/version", headers={"X-Api-Key": key})
+        assert code == 200, (code, payload)
+        assert payload["api"] == "0.1", payload
+        assert payload["text"].startswith("OctoPrint"), payload
+
+        code, payload = bridge_request(
+            base + "/api/version", headers={"X-Api-Key": "wrong"})
+        assert code == 401 and "api key" in payload["error"].lower(), (code, payload)
+
+        body, content_type = bridge_multipart(
+            "bridge part.gcode", b"; bridge\nG28\n", True)
+        code, payload = bridge_request(
+            base + "/api/files/local", method="POST", data=body,
+            headers={"X-Api-Key": key, "Content-Type": content_type})
+        assert code == 201 and payload.get("done") is True, (code, payload)
+        assert bridge_calls == [
+            ("upload", "bridge part.gcode", b"; bridge\nG28\n"),
+            ("start", 9001)], bridge_calls
+
+        body, content_type = bridge_multipart("plain.gcode", b"G28\n", False)
+        code, payload = bridge_request(
+            base + "/api/files/local", method="POST", data=body,
+            headers={"X-Api-Key": key, "Content-Type": content_type})
+        assert code == 201, (code, payload)
+        assert bridge_calls[-1] == ("upload", "plain.gcode", b"G28\n"), bridge_calls
+        assert len([call for call in bridge_calls if call[0] == "start"]) == 1
+
+        # Orca can be configured to send a .gcode.3mf bundle instead of a
+        # plain .gcode. The bridge extracts Metadata/plate_<n>.gcode first.
+        import io as _io
+        import zipfile as _zipfile
+
+        bundle_buffer = _io.BytesIO()
+        with _zipfile.ZipFile(bundle_buffer, "w") as archive:
+            archive.writestr("Metadata/plate_1.gcode", b"; from 3mf\nG28\n")
+        body, content_type = bridge_multipart(
+            "bundle.gcode.3mf", bundle_buffer.getvalue(), True)
+        code, payload = bridge_request(
+            base + "/api/files/local", method="POST", data=body,
+            headers={"X-Api-Key": key, "Content-Type": content_type})
+        assert code == 201, (code, payload)
+        assert bridge_calls[-2] == (
+            "upload", "bundle.gcode", b"; from 3mf\nG28\n"), bridge_calls
+        assert bridge_calls[-1] == ("start", 9001), bridge_calls
+
+        body, content_type = bridge_multipart("notes.txt", b"hello", True)
+        code, payload = bridge_request(
+            base + "/api/files/local", method="POST", data=body,
+            headers={"X-Api-Key": key, "Content-Type": content_type})
+        assert code == 400 and "gcode" in payload["error"].lower(), (code, payload)
+
+        module.print_preflight = lambda refresh=False: (
+            False, "A print is already in progress. This plugin will not interrupt it.")
+        body, content_type = bridge_multipart("blocked.gcode", b"G28\n", True)
+        code, payload = bridge_request(
+            base + "/api/files/local", method="POST", data=body,
+            headers={"X-Api-Key": key, "Content-Type": content_type})
+        assert code == 409 and "in progress" in payload["error"].lower(), (code, payload)
+        assert all(call[1] != "blocked.gcode" for call in bridge_calls), bridge_calls
+
+        status_payload = module.build_status()
+        assert status_payload["bridge"]["host"] == "127.0.0.1"
+        assert status_payload["bridge"]["api_key"] == key
+        assert bridge.status()["port"] > 0
+        print("localhost bridge: OK", base, [call[0] for call in bridge_calls])
+    finally:
+        bridge.stop()
+        module.upload_gcode_bytes = saved_upload_bytes
+        module.start_print = saved_start_print
+        module.print_preflight = saved_preflight
+    deadline = time.time() + 5.0
+    while time.time() < deadline and bridge.status()["running"]:
+        time.sleep(0.02)
+    assert not bridge.status()["running"], bridge.status()
+    deadline = time.time() + 2.0
+    while time.time() < deadline and module._upload_in_flight:
+        time.sleep(0.02)
+    assert not module._upload_in_flight, "bridge left the upload lock held"
+
+    ui = page.get_ui()
+    assert "127.0.0.1" in ui and "Octo/Klipper" in ui, "bridge setup card missing"
+    assert "bridgeBadge" in ui and "btnBridgeCopy" in ui
+    print("bridge dashboard card: OK")
 
     # The page must drive printer selection without host dialogs, and without
     # doing the network I/O on the UI thread (on_message runs there).

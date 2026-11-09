@@ -125,6 +125,25 @@ Details:
 - **Failure handling.** Any failure after order 1001 closes the order (`1002`) and publishes `stopCapture` where possible (KVS only). Start/stop use an in-flight guard plus a generation counter so a cancelled or superseded start cannot leave a camera session open. A superseded Agora worker cannot post frames or close the replacement session. `on_unload` publishes `stopCapture` synchronously, then finishes order 1002 and the MQTT disconnect on a worker thread.
 - **Open:** OrcaSlicer's WebView must support `RTCPeerConnection`, `RTCRtpReceiver.getCapabilities`, WSS connections to AWS/Agora and outbound STUN/UDP. This is verified in Chromium but not yet inside Orca (G7). If the WebView blocks either WSS host, playback needs a native bridge and this design must be revisited. The live Agora order-1001 response is untested because the printer was offline during development.
 
+### 3.9 Direct print bridge (v0.9.0)
+OrcaSlicer's **Octo/Klipper** physical-printer type speaks a small subset of the OctoPrint REST API. The plugin runs a server for that API on `127.0.0.1:5766`; a job sent from OrcaSlicer therefore lands in the plugin, which uploads it through the existing Anycubic Cloud pipeline and optionally starts it. Orca hides the separate Port field for this host type, so the printer preset uses `127.0.0.1:5766` as the hostname.
+
+Flow:
+1. `GET /api/version` returns `{"api":"0.1","server":"1.0","text":"OctoPrint 1.9.0 (Anycubic Cloud bridge)"}`. OrcaSlicer requires the `api` key and, for the OctoPrint host type, a `text` value starting with `OctoPrint`.
+2. `POST /api/files/local` is `multipart/form-data` with `file` (binary G-code), `print` (`true`/`false`), `path` (OrcaSlicer's local parent path, ignored) and an optional `plateindex`. Every request must carry `X-Api-Key`. OrcaSlicer's send dialog exposes **Upload** (`print=false`) and **Upload and Print** (`print=true`); the plugin only starts a job for the latter.
+3. With `print=false` the plugin uploads the file to cloud storage and returns 201. With `print=true` it first runs `print_preflight(refresh=True)`, refuses offline/busy printers, uploads, then calls `start_print(file_id)` and returns 201 only if the job started.
+4. Plain `.gcode` is uploaded as-is. An optional Orca `.gcode.3mf` bundle is read as a ZIP and `Metadata/plate_<plateindex>.gcode` (or the first plate) is extracted, so the printer receives real G-code.
+5. Errors return a JSON `{"error": ...}` body with 400 (bad file), 401 (bad key), 409 (printer busy/upload in flight) or 500 (cloud failure). OrcaSlicer surfaces the body in its upload error dialog.
+
+Implementation notes:
+- `ThreadingHTTPServer` binds to `127.0.0.1` only. The API key is generated once with `uuid4` and persisted in `state.json`; the dashboard shows it with a copy button and click-to-select.
+- Binding uses the declarative `network_socket` grant `('127.0.0.1', 5766)`. The port is fixed so the OrcaSlicer printer preset is configured once.
+- The server starts from the page's `on_load()` and is retried by the dashboard poll. A failed bind (port in use, permission denied) is shown on the dashboard and never crashes the plugin.
+- Bridge uploads share the dashboard's single-upload lock and progress state. `STATE.upload` is updated so the dashboard shows the same job while it runs.
+- The bridge intentionally exposes no `/api/job` control endpoints. Pause, resume and stop remain confirmed dashboard actions using orders 2/3/4; a sender that can reach the bridge cannot interrupt a print.
+- The localhost bridge was chosen over LAN mode because LAN mode disconnects the printer from Anycubic Cloud, the mobile app and the cloud camera. It also avoids unverified LAN support on the Kobra 2 Pro.
+- **Open:** OrcaSlicer's "Use 3MF instead of G-code" option is off by default; the bundle path is implemented but has not been exercised by a live OrcaSlicer upload. A live end-to-end Print from OrcaSlicer through the bridge is pending.
+
 ## 4. Device integration options
 - A. Virtual device profile: best UX, needs deep Orca internals.
 - B. Sidecar dialog + status tab: v1 fallback.
@@ -137,6 +156,7 @@ Choice is made after spike P1.
 - G2 login + getPrinters replay.
 - G3 MQTT connect/SUB/downlink.
 - G4 first upload + `sendOrder` → printer acknowledges the job. **Requires explicit user consent and an attended, online printer.** Upload, start print and the first live print are verified (2026-10-27).
+- G8 localhost bridge: version handshake, API-key rejection, upload, upload+print, `.gcode.3mf` extraction, busy refusal and shutdown are covered by the smoke test. A live OrcaSlicer **Print** through the bridge is pending.
 - G6 first live pause/resume/stop through the dashboard. **Requires explicit user consent; pause/resume/stop interrupt the current print.** The active-project lookup and control eligibility are verified read-only, but no control order has been sent yet.
 - G7 webcam inside OrcaSlicer's WebView: confirms `RTCPeerConnection`, `setCodecPreferences`, the AWS WSS connection and STUN/UDP media. The full sequence (orders 1001/1002, MQTT `startCapture`/`stopCapture`, KVS signaling, 640×480 H.264 decode) is verified live in Chromium; only the host WebView is unverified.
 - G5 removed (not needed for v1).
