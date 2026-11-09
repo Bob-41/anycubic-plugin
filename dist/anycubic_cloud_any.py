@@ -6,7 +6,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.8.9"
+# version = "0.9.0"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -59,14 +59,19 @@ startCapture and stopCapture.
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import queue
 import re
+import socketserver
 import ssl
 import threading
 import time
 import uuid
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 import orca
 
@@ -150,7 +155,17 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.8.9"
+PLUGIN_VERSION = "0.9.0"
+
+# Local OctoPrint-compatible bridge. OrcaSlicer's Physical Printer "Octo/Klipper"
+# host type uploads to this loopback server, which forwards the file to Anycubic
+# Cloud and (when print=true) starts it on the selected printer. The port is
+# fixed so the OrcaSlicer printer preset only has to be configured once; the
+# socket grant in register_capabilities() matches this exact address.
+BRIDGE_HOST = "127.0.0.1"
+BRIDGE_PORT = 5766
+BRIDGE_MAX_UPLOAD = 1024 * 1024 * 1024
+BRIDGE_RETRY_SECONDS = 10.0
 
 # G-code files are read from a local folder. The host grants file-read access
 # per directory tree, so keep the allowed roots to the usual export folders.
@@ -1776,6 +1791,7 @@ class PluginState:
         self.notice_error = False
         self.recent_messages = []
         self.watch_dir = DEFAULT_WATCH_DIR
+        self.bridge_api_key = ""
         self.upload = None
         self._state_mtime = 0
         self._load()
@@ -1806,6 +1822,7 @@ class PluginState:
         self.printer = data.get("printer") if isinstance(data.get("printer"), dict) else None
         self.failed_token_sha = data.get("failed_token_sha") or ""
         self.watch_dir = data.get("watch_dir") or DEFAULT_WATCH_DIR
+        self.bridge_api_key = data.get("bridge_api_key") or ""
         self._state_mtime = self._state_file_mtime()
 
     def reload_if_changed(self) -> bool:
@@ -1827,6 +1844,7 @@ class PluginState:
                 "printer": self.printer,
                 "failed_token_sha": self.failed_token_sha,
                 "watch_dir": self.watch_dir,
+                "bridge_api_key": self.bridge_api_key,
             }
         tmp = STATE_PATH + ".tmp"
         try:
@@ -2939,12 +2957,48 @@ def _put_presigned(url, path, size, on_progress=None):
         on_progress(100.0)
 
 
-def upload_gcode(path, on_progress=None):
-    """Upload one G-code file and return ``{file_id, name, size}``.
+def _put_presigned_bytes(url, data, on_progress=None):
+    """PUT an in-memory G-code body to the signed S3 URL."""
+    from urllib import error as urlerror
+    from urllib import request as urlrequest
 
-    ``on_progress(phase, percent)`` is called with phases lock/upload/claim/
-    unlock/done. The cloud lock is always released, and a lock without a
-    claimed file is deleted again.
+    size = len(data)
+    req = urlrequest.Request(url, data=data, method="PUT")
+    req.add_header("Content-Length", str(size))
+    req.add_header("Content-Type", "application/octet-stream")
+    try:
+        with urlrequest.urlopen(req, timeout=600) as resp:
+            try:
+                resp.read(4096)
+            except Exception:
+                pass
+            if resp.status not in (200, 201):
+                raise UploadError(
+                    "Cloud storage rejected the upload (HTTP %s)." % resp.status)
+    except urlerror.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read(300).decode("utf-8", "replace").strip()
+        except Exception:
+            pass
+        raise UploadError("Cloud storage rejected the upload (HTTP %s)%s" % (
+            exc.code, ": " + detail if detail else "."))
+    except UploadError:
+        raise
+    except Exception as exc:
+        raise UploadError("Upload failed: %s" % exc)
+
+    if on_progress is not None:
+        on_progress(100.0)
+
+
+def _upload_gcode_common(source, name, size, on_progress=None):
+    """Upload a path or in-memory body and return ``{file_id, name, size}``.
+
+    ``source`` is either a filesystem path (streamed, used by the folder panel)
+    or bytes (used by the localhost bridge). ``on_progress(phase, percent)`` is
+    called with phases lock/upload/claim/unlock/done. The cloud lock is always
+    released, and a lock without a claimed file is deleted again.
     """
     def report(phase, percent):
         if on_progress is None:
@@ -2953,17 +3007,6 @@ def upload_gcode(path, on_progress=None):
             on_progress(phase, max(0.0, min(100.0, float(percent))))
         except Exception:
             pass
-
-    real = _safe_gcode_path(path)
-    if real is None:
-        raise UploadError("Choose a .gcode file inside the watch folder.")
-    name = os.path.basename(real)
-    try:
-        size = int(os.path.getsize(real))
-    except OSError as exc:
-        raise UploadError("Could not read the file: %s" % exc)
-    if size <= 0:
-        raise UploadError("That G-code file is empty.")
 
     with STATE.lock:
         token = STATE.workbench_token
@@ -2993,10 +3036,11 @@ def upload_gcode(path, on_progress=None):
     file_id = None
     try:
         report("upload", 2.0)
-        _put_presigned(
-            presigned, real, size,
-            lambda pct: report("upload", 2.0 + pct * 0.9),
-        )
+        progress = lambda pct: report("upload", 2.0 + pct * 0.9)
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            _put_presigned_bytes(presigned, bytes(source), progress)
+        else:
+            _put_presigned(presigned, source, size, progress)
         report("claim", 93.0)
         try:
             claim = _http_json(
@@ -3026,6 +3070,36 @@ def upload_gcode(path, on_progress=None):
 
     report("done", 100.0)
     return {"file_id": int(file_id), "name": name, "size": size}
+
+
+def upload_gcode(path, on_progress=None):
+    """Upload one G-code file from the watch folder."""
+    real = _safe_gcode_path(path)
+    if real is None:
+        raise UploadError("Choose a .gcode file inside the watch folder.")
+    name = os.path.basename(real)
+    try:
+        size = int(os.path.getsize(real))
+    except OSError as exc:
+        raise UploadError("Could not read the file: %s" % exc)
+    if size <= 0:
+        raise UploadError("That G-code file is empty.")
+    return _upload_gcode_common(real, name, size, on_progress)
+
+
+def upload_gcode_bytes(data, name, on_progress=None):
+    """Upload G-code held in memory (used by the localhost bridge)."""
+    name = os.path.basename(str(name or "").replace("\\", "/")).strip()
+    if not name:
+        name = "upload.gcode"
+    if not name.lower().endswith(WATCH_EXTENSIONS):
+        raise UploadError("Only .gcode files can be sent to the local bridge.")
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise UploadError("The bridge upload body was not a file.")
+    body = bytes(data)
+    if not body:
+        raise UploadError("That G-code file is empty.")
+    return _upload_gcode_common(body, name, len(body), on_progress)
 
 
 # ============================================================================
@@ -3149,6 +3223,485 @@ def start_print(file_id, printer_id=None):
         time.sleep(START_PRINT_RETRY_DELAY)
 
     return False, "The printer rejected the print request: %s" % last_message
+
+
+# ============================================================================
+# Local OctoPrint-compatible bridge (direct print from OrcaSlicer)
+# ============================================================================
+
+# Only one upload at a time across the dashboard and the bridge: the cloud
+# locks storage per file and the UI has a single progress panel.
+_upload_lock = threading.Lock()
+_upload_in_flight = False
+
+
+def _begin_upload():
+    global _upload_in_flight
+    with _upload_lock:
+        if _upload_in_flight:
+            return False
+        _upload_in_flight = True
+        return True
+
+
+def _end_upload():
+    global _upload_in_flight
+    with _upload_lock:
+        _upload_in_flight = False
+
+
+def bridge_api_key():
+    """Return the persisted API key, generating it on first use."""
+    with STATE.lock:
+        key = STATE.bridge_api_key
+    if key:
+        return key
+    key = uuid.uuid4().hex + uuid.uuid4().hex
+    with STATE.lock:
+        if not STATE.bridge_api_key:
+            STATE.bridge_api_key = key
+            STATE.save()
+        return STATE.bridge_api_key
+
+
+def _parse_multipart_form(content_type, body):
+    """Parse a multipart/form-data body into ``{name: {filename, data}}``.
+
+    OrcaSlicer/curl sends the G-code as a raw binary part, so this splits on
+    the boundary bytes and keeps the payload untouched. The standard-library
+    alternatives either normalise line endings (email) or are removed in
+    Python 3.13 (cgi).
+    """
+    match = re.search(r'boundary="?([^";]+)"?', content_type or "", re.I)
+    if not match:
+        return {}
+    marker = b"--" + match.group(1).encode("latin-1", "replace")
+    fields = {}
+    for part in body.split(marker)[1:]:
+        if part.startswith(b"--"):
+            break
+        if part.startswith(b"\r\n"):
+            part = part[2:]
+        elif part.startswith(b"\n"):
+            part = part[1:]
+
+        head, separator, data = part.partition(b"\r\n\r\n")
+        if not separator:
+            head, separator, data = part.partition(b"\n\n")
+        if not separator:
+            continue
+        if data.endswith(b"\r\n"):
+            data = data[:-2]
+        elif data.endswith(b"\n"):
+            data = data[:-1]
+
+        headers = {}
+        for line in head.replace(b"\r\n", b"\n").split(b"\n"):
+            if b":" not in line:
+                continue
+            name, value = line.split(b":", 1)
+            try:
+                headers[name.strip().lower().decode("ascii")] = (
+                    value.strip().decode("utf-8", "replace"))
+            except Exception:
+                continue
+
+        disposition = headers.get("content-disposition", "")
+        name_match = re.search(r'\bname="([^"]*)"', disposition)
+        if not name_match:
+            continue
+        filename_match = re.search(r'\bfilename="([^"]*)"', disposition)
+        fields[name_match.group(1)] = {
+            "filename": filename_match.group(1) if filename_match else None,
+            "data": data,
+        }
+    return fields
+
+
+def _field_value(fields, name):
+    item = fields.get(name) or {}
+    return (item.get("data") or b"").decode("utf-8", "replace").strip()
+
+
+def _gcode_from_3mf(data, plateindex=""):
+    """Extract the sliced G-code from an Orca ``.gcode.3mf`` bundle."""
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except Exception as exc:
+        raise UploadError("Could not read the .gcode.3mf bundle: %s" % exc)
+    with archive:
+        names = archive.namelist()
+        chosen = ""
+        if plateindex:
+            try:
+                wanted = "Metadata/plate_%d.gcode" % int(plateindex)
+            except (TypeError, ValueError):
+                wanted = ""
+            if wanted and wanted in names:
+                chosen = wanted
+        if not chosen:
+            plates = sorted(
+                name for name in names
+                if re.match(r"^Metadata/plate_\d+\.gcode$", name))
+            if plates:
+                chosen = plates[0]
+        if not chosen:
+            gcodes = sorted(
+                name for name in names if name.lower().endswith(".gcode"))
+            if gcodes:
+                chosen = gcodes[0]
+        if not chosen:
+            raise UploadError(
+                "The .gcode.3mf bundle did not contain a G-code file.")
+        info = archive.getinfo(chosen)
+        if info.file_size > BRIDGE_MAX_UPLOAD:
+            raise UploadError(
+                "The G-code inside the .gcode.3mf bundle is larger than the "
+                "bridge limit (%d MB)." % (BRIDGE_MAX_UPLOAD // (1024 * 1024)))
+        try:
+            return archive.read(chosen)
+        except Exception as exc:
+            raise UploadError(
+                "Could not extract the G-code from the .gcode.3mf bundle: %s"
+                % exc)
+
+
+def _bridge_bind_error(exc, port):
+    if isinstance(exc, PermissionError) or "permission" in str(exc).lower():
+        return (
+            "OrcaSlicer blocked the local bridge from opening port %d. "
+            "Re-enable the plugin and approve its network permission." % port)
+    errno = getattr(exc, "errno", None)
+    if errno in (48, 98, 10048):
+        return (
+            "Port %d is already in use. Close whatever is using it, then "
+            "reopen the Anycubic Cloud tab." % port)
+    return "The local bridge could not start: %s" % (str(exc) or "unknown error")
+
+
+class _BridgeHandler(BaseHTTPRequestHandler):
+    """Minimal OctoPrint REST surface used by OrcaSlicer's print-host upload."""
+
+    server_version = "AnycubicBridge/1.0"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        # The bridge is intentionally quiet; errors reach the dashboard.
+        pass
+
+    def _send_json(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _error(self, status, message):
+        self._send_json(status, {"error": str(message)})
+
+    def _authorized(self):
+        expected = str(getattr(self.server, "api_key", "") or "")
+        if not expected:
+            return True
+        provided = str(self.headers.get("X-Api-Key", "") or "").strip()
+        try:
+            return hmac.compare_digest(provided, expected)
+        except TypeError:
+            return False
+
+    def _require_auth(self):
+        if self._authorized():
+            return True
+        self._error(
+            401,
+            "Invalid API key. Copy the key from the Anycubic Cloud dashboard.")
+        return False
+
+    def do_GET(self):
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if not self._require_auth():
+            return
+        if path == "/api/version":
+            self._send_json(200, {
+                "api": "0.1",
+                "server": "1.0",
+                "text": "OctoPrint 1.9.0 (Anycubic Cloud bridge)",
+            })
+            return
+        self._error(404, "Not found.")
+
+    def do_POST(self):
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if not self._require_auth():
+            return
+        if path == "/api/files/local":
+            self._upload()
+            return
+        self._error(404, "Not found.")
+
+    def _upload(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            self._error(400, "Invalid Content-Length.")
+            return
+        if length <= 0:
+            self._error(400, "The upload body is empty.")
+            return
+        if length > BRIDGE_MAX_UPLOAD:
+            self._error(413, "The upload is larger than the bridge limit (%d MB)." % (
+                BRIDGE_MAX_UPLOAD // (1024 * 1024)))
+            return
+        try:
+            body = self.rfile.read(length)
+        except Exception as exc:
+            self._error(400, "Could not read the upload: %s" % exc)
+            return
+        if len(body) != length:
+            self._error(400, "The upload was cut short.")
+            return
+
+        content_type = self.headers.get("Content-Type") or ""
+        if "multipart/form-data" not in content_type.lower():
+            self._error(415, "Expected multipart/form-data.")
+            return
+        fields = _parse_multipart_form(content_type, body)
+        item = fields.get("file") or {}
+        filename = os.path.basename(
+            str(item.get("filename") or "").replace("\\", "/")).strip()
+        data = item.get("data") or b""
+        if not filename:
+            self._error(400, "No file was included in the upload.")
+            return
+        bundle = filename.lower().endswith(".gcode.3mf")
+        if not bundle and not filename.lower().endswith(WATCH_EXTENSIONS):
+            self._error(
+                400, "The bridge only accepts .gcode files (got %s)." % filename)
+            return
+        if not data:
+            self._error(400, "That G-code file is empty.")
+            return
+        if bundle:
+            try:
+                data = _gcode_from_3mf(
+                    data, _field_value(fields, "plateindex"))
+            except UploadError as exc:
+                self._error(400, str(exc))
+                return
+            filename = filename[:-4]
+            if not data:
+                self._error(400, "The .gcode.3mf bundle contained an empty G-code file.")
+                return
+
+        print_it = _field_value(fields, "print").lower() in (
+            "true", "1", "yes", "on")
+        if print_it:
+            ok, message = print_preflight(refresh=True)
+            if not ok:
+                self._error(409, message)
+                return
+
+        if not _begin_upload():
+            self._error(409, "An upload is already in progress.")
+            return
+
+        bridge = getattr(self.server, "bridge", None)
+        try:
+            STATE.set_upload({
+                "name": filename, "phase": "upload", "percent": 0,
+                "done": False, "ok": None, "message": "", "file_id": None,
+            })
+
+            def progress(phase, percent):
+                STATE.patch_upload(
+                    name=filename, phase=phase, percent=round(percent, 1),
+                    done=False, ok=None, message="", file_id=None)
+                if bridge is not None and phase in ("upload", "claim"):
+                    with bridge.lock:
+                        bridge.last_job = filename
+
+            result = upload_gcode_bytes(data, filename, progress)
+            if print_it:
+                STATE.patch_upload(
+                    name=result["name"], phase="start", percent=100,
+                    done=False, ok=None, message="", file_id=result["file_id"])
+                ok, message = start_print(result["file_id"])
+                if not ok:
+                    raise UploadError(
+                        "Uploaded %s (cloud file #%s), but the print did not "
+                        "start: %s" % (
+                            result["name"], result["file_id"], message))
+
+            message = "Uploaded %s to Anycubic Cloud (file #%s)." % (
+                result["name"], result["file_id"])
+            if print_it:
+                message = "Uploaded %s and started printing (cloud file #%s)." % (
+                    result["name"], result["file_id"])
+            STATE.patch_upload(
+                name=result["name"], phase="done", percent=100, done=True,
+                ok=True, message=message, file_id=result["file_id"])
+            if bridge is not None:
+                with bridge.lock:
+                    bridge.last_job = result["name"]
+                    bridge.last_error = ""
+            self._send_json(201, {
+                "done": True,
+                "files": {"local": {
+                    "name": result["name"],
+                    "origin": "local",
+                    "path": result["name"],
+                }},
+            })
+        except Exception as exc:
+            message = str(exc) or "Upload failed."
+            STATE.patch_upload(
+                name=filename, phase="error", percent=0, done=True,
+                ok=False, message=message, file_id=None)
+            STATE.set_notice(message, error=True)
+            if bridge is not None:
+                with bridge.lock:
+                    bridge.last_error = message
+            self._error(500, message)
+        finally:
+            _end_upload()
+
+
+class _BridgeHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def server_bind(self):
+        # HTTPServer.server_bind() calls socket.getfqdn(), which performs a
+        # reverse-DNS lookup. The bridge is loopback-only, and that lookup can
+        # stall or be blocked by the host's socket audit hook.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+
+class BridgeService:
+    """Run the loopback OctoPrint-compatible server in a daemon thread."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.server = None
+        self.thread = None
+        self.port = BRIDGE_PORT
+        self.error = ""
+        self.error_ts = 0.0
+        self.stopping = False
+        self.last_job = ""
+        self.last_error = ""
+
+    def start(self, port=None):
+        wanted = BRIDGE_PORT if port is None else int(port)
+        with self.lock:
+            if self.server is not None:
+                return True
+            if self.thread is not None and self.thread.is_alive():
+                return True
+            if self.error and (_now() - self.error_ts) < BRIDGE_RETRY_SECONDS:
+                return False
+            self.error = ""
+            self.stopping = False
+            self.port = wanted
+            thread = threading.Thread(
+                target=self._serve, args=(wanted, bridge_api_key()),
+                name="anycubic-bridge", daemon=True)
+            self.thread = thread
+        thread.start()
+        return True
+
+    def _serve(self, port, api_key):
+        server = None
+        try:
+            server = _BridgeHTTPServer((BRIDGE_HOST, port), _BridgeHandler)
+            server.api_key = api_key
+            server.bridge = self
+            with self.lock:
+                if self.stopping:
+                    server.server_close()
+                    self.thread = None
+                    return
+                self.server = server
+                self.port = int(server.server_address[1])
+                self.error = ""
+            server.serve_forever(poll_interval=0.25)
+        except Exception as exc:
+            with self.lock:
+                self.error = _bridge_bind_error(exc, port)
+                self.error_ts = _now()
+                self.server = None
+        finally:
+            if server is not None:
+                try:
+                    server.server_close()
+                except Exception:
+                    pass
+            with self.lock:
+                if self.server is server:
+                    self.server = None
+                self.thread = None
+
+    def stop(self):
+        with self.lock:
+            self.stopping = True
+            server = self.server
+            self.server = None
+        if server is not None:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+
+    def status(self):
+        with self.lock:
+            return {
+                "running": self.server is not None,
+                "host": BRIDGE_HOST,
+                "port": self.port,
+                "error": self.error,
+                "last_job": self.last_job,
+                "last_error": self.last_error,
+            }
+
+
+BRIDGE = BridgeService()
+
+
+def start_bridge():
+    """Start the loopback bridge once; safe to call on every poll."""
+    try:
+        return BRIDGE.start()
+    except Exception as exc:
+        with BRIDGE.lock:
+            BRIDGE.error = "The local bridge could not start: %s" % exc
+            BRIDGE.error_ts = _now()
+        return False
+
+
+def stop_bridge():
+    try:
+        BRIDGE.stop()
+    except Exception:
+        pass
+
+
+def bridge_status():
+    status = BRIDGE.status()
+    with STATE.lock:
+        status["api_key"] = STATE.bridge_api_key
+    return status
 
 
 # ============================================================================
@@ -3495,6 +4048,7 @@ def build_status():
             "last_report": video_age,
         },
         "upload": upload,
+        "bridge": bridge_status(),
         "notice": notice,
         "notice_error": notice_error,
         "raw": raw,
@@ -4006,6 +4560,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                      text-align: center; padding: 20px; color: #bbb; font-size: 13px; line-height: 1.45; }
   #camError { margin-top: 8px; padding: 9px 11px; border-radius: 7px; font-size: 12px;
               background: rgba(244,67,54,.1); color: #c62828; display: none; line-height: 1.4; }
+  code { font-family: ui-monospace, monospace; font-size: 12px; padding: 2px 7px; border-radius: 5px;
+         background: var(--orca-border, #f0f0f0); }
+  #bridgeKey { cursor: pointer; }
+  #bridgeError { margin-top: 8px; padding: 9px 11px; border-radius: 7px; font-size: 12px;
+                 background: rgba(244,67,54,.1); color: #c62828; display: none; line-height: 1.4; }
   #notice { margin-top: 14px; padding: 10px 12px; border-radius: 8px; font-size: 13px; display: none; }
   #notice.info { display: block; background: rgba(0,150,136,.1); color: #00796b; }
   #notice.error { display: block; background: rgba(244,67,54,.1); color: #c62828; }
@@ -4041,6 +4600,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <button id="pickerClose">Close</button>
     </div>
     <div id="pickerList" style="margin-top:10px"></div>
+  </div>
+
+  <div class="section">Direct print from OrcaSlicer</div>
+  <div class="card" style="margin-top:10px">
+    <div class="row">
+      <b>Local bridge</b>
+      <span id="bridgeBadge" class="badge off">Starting…</span>
+      <div class="spacer"></div>
+      <button id="btnBridgeCopy">Copy API key</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <span class="muted">Host</span><code>127.0.0.1</code>
+      <span class="muted">Port</span><code id="bridgePort">5766</code>
+      <span class="muted">API key</span><code id="bridgeKey" title="Click to select">—</code>
+    </div>
+    <div class="muted" style="margin-top:8px; line-height:1.5">
+      In OrcaSlicer open <b>Printer settings → Physical Printer</b>, choose
+      <b>Octo/Klipper</b>, and enter <code id="bridgeHost">127.0.0.1:5766</code>
+      as the <b>Hostname</b> plus the API key below. Then press <b>Print</b>
+      and choose <b>Upload and Print</b> in the send dialog: OrcaSlicer sends
+      the job to this bridge, which uploads it to Anycubic Cloud and starts it
+      on the selected printer. No export folder and no manual upload needed.
+    </div>
+    <div id="bridgeError"></div>
+    <div class="muted" id="bridgeLast" style="margin-top:8px"></div>
   </div>
 
   <div class="section">Temperatures</div>
@@ -4182,6 +4766,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   var pending = null;
   var pendingControl = null;
   var currentUpload = null;
+  var bridgeKey = "";
   var camPC = null;
   var camWS = null;
   var camTimer = null;
@@ -4446,6 +5031,65 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     });
     updateFileButtons();
   }
+  function renderBridge(b) {
+    b = b || {};
+    bridgeKey = b.api_key || "";
+    var badge = $("bridgeBadge");
+    if (b.running) {
+      badge.textContent = "Listening";
+      badge.className = "badge ok";
+    } else if (b.error) {
+      badge.textContent = "Not running";
+      badge.className = "badge err";
+    } else {
+      badge.textContent = "Starting…";
+      badge.className = "badge off";
+    }
+    $("bridgePort").textContent = b.port || 5766;
+    if ($("bridgeHost")) {
+      $("bridgeHost").textContent = (b.host || "127.0.0.1") + ":" + (b.port || 5766);
+    }
+    $("bridgeKey").textContent = bridgeKey || "starting…";
+    var err = $("bridgeError");
+    if (b.error) {
+      err.textContent = b.error;
+      err.style.display = "block";
+    } else {
+      err.textContent = "";
+      err.style.display = "none";
+    }
+    var last = [];
+    if (b.last_job) last.push("Last bridge job: " + b.last_job);
+    if (b.last_error) last.push(b.last_error);
+    $("bridgeLast").textContent = last.join(" · ");
+  }
+  function copyBridgeKey() {
+    if (!bridgeKey) {
+      showNotice("The local bridge is still starting.", true);
+      return;
+    }
+    function done(ok) {
+      showNotice(ok
+        ? "API key copied. Paste it into the printer's API key field."
+        : "Select the key on the dashboard and copy it manually.", !ok);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(bridgeKey).then(
+        function () { done(true); },
+        function () { done(false); });
+      return;
+    }
+    var area = document.createElement("textarea");
+    area.value = bridgeKey;
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    document.body.removeChild(area);
+    done(ok);
+  }
   function renderUpload(up) {
     currentUpload = up || null;
     var box = $("uploadBox");
@@ -4453,8 +5097,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       box.style.display = "none";
       updateFileButtons();
       return;
-    }
-    box.style.display = "block";
+    }    box.style.display = "block";
     var pct = (up.percent === null || up.percent === undefined) ? 0 : up.percent;
     pct = Math.max(0, Math.min(100, pct));
     $("uploadBar").style.width = (up.done && up.ok !== false ? 100 : pct) + "%";
@@ -5011,6 +5654,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     lastStatus = d;
     renderFiles(d.watch || {});
+    renderBridge(d.bridge || {});
     renderUpload(d.upload || null);
     updateJobControls();
     updateCameraControls();
@@ -5088,6 +5732,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     B.postMessage({ type: "select_printer" });
   };
   $("pickerClose").onclick = function () { $("picker").style.display = "none"; };
+
+  $("btnBridgeCopy").onclick = copyBridgeKey;
+  $("bridgeKey").onclick = function () {
+    var range = document.createRange();
+    range.selectNodeContents(this);
+    var selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
 
   $("btnRefreshFiles").onclick = function () {
     $("watchHint").textContent = "Scanning the watch folder…";
@@ -5401,8 +6054,7 @@ def login_async(token: str) -> bool:
 
 # Only one upload at a time: the cloud locks storage per file and the UI has a
 # single progress panel.
-_upload_lock = threading.Lock()
-_upload_in_flight = False
+# (Defined with the bridge, before build_status, so both paths share the lock.)
 
 
 # ============================================================================
@@ -5451,6 +6103,10 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
 
         if kind == "poll":
             self._sync_config_token()
+            try:
+                start_bridge()
+            except Exception:
+                pass
             if WATCH_BACKGROUND:
                 try:
                     ensure_watch_thread()
@@ -5899,6 +6555,10 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
             request_watch_refresh(force=True)
         except Exception:
             pass
+        try:
+            start_bridge()
+        except Exception:
+            pass
 
     def on_unload(self):
         # Close the camera before disconnecting MQTT: stopCapture needs the
@@ -5932,6 +6592,10 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
             target=worker, name="anycubic-unload", daemon=True).start()
         try:
             stop_watch_thread()
+        except Exception:
+            pass
+        try:
+            stop_bridge()
         except Exception:
             pass
 
@@ -6090,6 +6754,7 @@ class AnycubicCloudPlugin(orca.base):
             network_socket=[
                 "('', 0)",
                 "('mqtt-universe.anycubic.com', 8883)",
+                "('127.0.0.1', 5766)",
             ],
             threading=True,
         )
