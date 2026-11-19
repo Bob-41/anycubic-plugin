@@ -6,7 +6,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.9.0"
+# version = "0.9.1"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -155,7 +155,7 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.9.0"
+PLUGIN_VERSION = "0.9.1"
 
 # Local OctoPrint-compatible bridge. OrcaSlicer's Physical Printer "Octo/Klipper"
 # host type uploads to this loopback server, which forwards the file to Anycubic
@@ -3414,12 +3414,43 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         except TypeError:
             return False
 
+    def _send_text(self, status):
+        body = (
+            "<!doctype html><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width\">"
+            "<title>Anycubic Cloud</title>"
+            "<style>"
+            "body{margin:0;padding:32px;color-scheme:light dark;"
+            "font:15px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',"
+            "sans-serif;max-width:42rem}"
+            "h1{font-size:20px;line-height:1.25;margin:0 0 12px}"
+            "p{margin:0 0 10px}"
+            ".note{opacity:.68;font-size:13px}"
+            "</style>"
+            "<h1>Print progress is in Anycubic Cloud</h1>"
+            "<p>Open the Anycubic Cloud tab in OrcaSlicer to view status, "
+            "temperatures, and the camera.</p>"
+            "<p class=\"note\">This local bridge only handles print uploads.</p>"
+        ).encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            pass
+
     def _require_auth(self):
         if self._authorized():
             return True
-        self._error(
-            401,
-            "Invalid API key. Copy the key from the Anycubic Cloud dashboard.")
+        if self.command == "GET":
+            self._send_text(401)
+        else:
+            self._error(
+                401,
+                "Invalid API key. Copy the key from the Anycubic Cloud dashboard.")
         return False
 
     def do_GET(self):
@@ -4568,6 +4599,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   #notice { margin-top: 14px; padding: 10px 12px; border-radius: 8px; font-size: 13px; display: none; }
   #notice.info { display: block; background: rgba(0,150,136,.1); color: #00796b; }
   #notice.error { display: block; background: rgba(244,67,54,.1); color: #c62828; }
+  .printer-choice:focus-visible { outline: 2px solid var(--orca-accent, #2f9e79); outline-offset: 2px; }
   details { margin-top: 18px; }
   pre { font-size: 11px; max-height: 220px; overflow: auto; background: var(--orca-border, #f5f5f5); padding: 10px; border-radius: 8px; text-align: left; }
 </style>
@@ -4587,8 +4619,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <span class="muted" id="loginState">Checking sign-in…</span>
     <div class="spacer"></div>
     <button id="btnSelect">Select printer</button>
-    <button id="btnStart" class="primary">Start monitoring</button>
     <button id="btnStop">Stop monitoring</button>
+  </div>
+
+  <div class="muted" id="autoNote" style="display:none">
+    Monitoring starts automatically with the selected printer.
   </div>
 
   <div id="notice"></div>
@@ -5139,35 +5174,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     var list = $("pickerList");
     list.innerHTML = "";
     if (d.error) {
-      list.innerHTML = '<div class="muted">' + d.error.replace(/</g, "&lt;") + "</div>";
+      list.innerHTML = '<div class="muted">' + d.error.replace(/</g, "<") + "</div>";
       return;
     }
-    if (!d.items || !d.items.length) {
+    var items = d.items;
+    if (typeof items === "string") {
+      try { items = JSON.parse(items); } catch (e) { items = []; }
+    }
+    if (!Array.isArray(items)) items = [];
+    if (!items.length) {
       list.innerHTML = '<div class="muted">No FDM printers on this Anycubic account.</div>';
       return;
     }
-    d.items.forEach(function (p) {
-      var row = document.createElement("div");
-      row.className = "row";
-      row.style.cssText = "padding:8px;border:1px solid var(--orca-border,#e3e3e3);border-radius:8px;margin-bottom:6px;cursor:pointer";
+    items.forEach(function (p) {
+      var row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'row printer-choice';
+      row.style.cssText = 'width:100%;font:inherit;color:inherit;text-align:left;'
+        + 'background:transparent;padding:8px;border:1px solid '
+        + 'var(--orca-border,#e3e3e3);border-radius:8px;margin-bottom:6px;'
+        + 'cursor:pointer';
+      row.setAttribute('aria-label', 'Select ' + (p.name || 'printer'));
       var badge = p.online
         ? '<span class="badge ok">Online</span>'
         : '<span class="badge off">Offline</span>';
-      row.innerHTML = '<b>' + (p.name || "Printer").replace(/</g, "&lt;") + "</b>" +
-                      '<span class="muted">' + (p.model || "") + "</span>" +
+      row.innerHTML = '<b>' + (p.name || 'Printer').replace(/</g, "<") + '</b>' +
+                      '<span class="muted">' + (p.model || '') + '</span>' +
                       '<span class="spacer"></span>' + badge;
       row.onclick = function () {
         list.innerHTML = '<div class="muted">Selecting…</div>';
-        B.postMessage({ type: "pick_printer", id: p.id });
+        B.postMessage({ type: 'pick_printer', id: p.id });
       };
       list.appendChild(row);
     });
-  }
-  function camSetBadge(text, cls) {
-    var badge = $("camBadge");
-    badge.textContent = text;
-    badge.className = "badge " + (cls || "off");
-  }
+  }}
   function camCleanup() {
     if (camTimer) { clearTimeout(camTimer); camTimer = null; }
     var pc = camPC;
@@ -5594,7 +5634,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     if (!d.login) hint = "Sign in to use the camera.";
     else if (!hasPrinter) hint = "Select a printer first.";
     else if (!online) hint = "The printer is offline on Anycubic Cloud.";
-    else if (!monitoring) hint = "Start monitoring first: the dashboard needs the printer's cloud session.";
+    else if (!monitoring) hint = "Connecting to the printer's cloud session…";
     else if (camState === "live") hint = "Live view. The camera does not affect the print.";
     else if (camState === "starting" || camState === "connecting") hint = "Opening the camera…";
     else if (camState === "error") hint = "Camera unavailable. Check the printer and try again.";
@@ -5602,6 +5642,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     $("camHint").textContent = hint;
   }
   function render(d) {
+    if (typeof d === "string") {
+      try { d = JSON.parse(d); } catch (e) { return; }
+    }
     if (d && d.type === "printers") {
       if (d.closed) { $("picker").style.display = "none"; return; }
       renderPrinters(d);
@@ -5718,12 +5761,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       ? Object.keys(d.raw).map(function (k) { return "// " + k + "\\n" + d.raw[k]; }).join("\\n\\n")
       : "No MQTT data yet.";
 
-    $("btnStart").disabled = !!d.monitoring;
+    var autoNote = $("autoNote");
+    autoNote.style.display = (printer.name && !d.monitoring) ? "block" : "none";
+
     $("btnStop").disabled = !d.monitoring;
   }
   B.onMessage(render);
 
-  $("btnStart").onclick = function () { B.postMessage({ type: "start_monitor" }); };
   $("btnStop").onclick = function () { B.postMessage({ type: "stop_monitor" }); };
   $("btnSelect").onclick = function () {
     var box = $("picker");
@@ -6012,13 +6056,78 @@ def select_printer_by_id(printer_id):
     return None
 
 
-def restart_monitoring_if_running(name):
+def start_monitoring_for_selection():
+    """Connect, or reconnect, MQTT after a printer selection."""
     with STATE.lock:
         service = STATE.mqtt_service
     if service is not None and service.running:
         service.stop()
-        return start_monitoring()
-    return True, "Monitoring is not running."
+    return start_monitoring()
+
+
+def _auto_setup_once():
+    """Select the account's only printer and start monitoring."""
+    with STATE.lock:
+        if not STATE.is_logged_in():
+            return False, ""
+        printer = dict(STATE.printer or {})
+
+    try:
+        printers = list_printers()
+    except Exception as exc:
+        if not printer.get("id"):
+            return False, "Could not load printers: %s" % exc
+        printers = None
+
+    if printers is not None:
+        ids = [item.get("id") for item in printers]
+        if len(printers) == 1 and printer.get("id") != ids[0]:
+            chosen = select_printer_by_id(ids[0])
+            if chosen is None:
+                return False, "That printer is no longer on this account."
+            printer = chosen
+            STATE.set_notice("Selected %s." % (chosen.get("name") or "printer"))
+        elif printer.get("id") not in ids:
+            select_printer({})
+            printer = {}
+            if len(printers) > 1:
+                return False, ""
+
+    if not printer.get("id"):
+        return False, ""
+    return start_monitoring()
+
+
+_auto_setup_lock = threading.Lock()
+_auto_setup_thread = None
+
+
+def auto_setup_async():
+    """Run auto-setup on a worker thread so page callbacks stay responsive."""
+    global _auto_setup_thread
+    with STATE.lock:
+        if not STATE.is_logged_in():
+            return False
+    with _auto_setup_lock:
+        if _auto_setup_thread is not None and _auto_setup_thread.is_alive():
+            return False
+
+        def worker():
+            global _auto_setup_thread
+            try:
+                ok, message = _auto_setup_once()
+                if message:
+                    STATE.set_notice(message, error=not ok)
+            except Exception as exc:
+                STATE.set_notice("Auto-connect failed: %s" % exc, error=True)
+            finally:
+                with _auto_setup_lock:
+                    _auto_setup_thread = None
+
+        _auto_setup_thread = threading.Thread(
+            target=worker, name="anycubic-auto-setup", daemon=True)
+        _auto_setup_thread.start()
+    return True
 
 
 # ============================================================================
@@ -6042,6 +6151,8 @@ def login_async(token: str) -> bool:
         try:
             ok, message = login_with_rs256(token)
             STATE.set_notice(message, error=not ok)
+            if ok:
+                auto_setup_async()
         except Exception as exc:
             STATE.set_notice("Login failed: %s" % exc, error=True)
         finally:
@@ -6114,12 +6225,6 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
                     pass
             refresh_printer()
             refresh_project()
-            self._post_status()
-            return
-
-        if kind == "start_monitor":
-            ok, message = start_monitoring()
-            STATE.set_notice(message, error=not ok)
             self._post_status()
             return
 
@@ -6289,7 +6394,7 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
                                    "error": "That printer is no longer on this account."})
                 return
             name = printer.get("name") or "printer"
-            ok, message = restart_monitoring_if_running(name)
+            ok, message = start_monitoring_for_selection()
             STATE.set_notice("Selected %s. %s" % (name, message), error=not ok)
             page.post_message({"type": "printers", "items": [], "closed": True})
             page._post_status()
@@ -6485,8 +6590,10 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
     def _sync_config_token(self):
         """Keep the Config tab in step with the cached session, and exchange a token if signed out."""
         # Another process (or a fresh sign-in) may have rewritten state.json.
+        reloaded = False
         try:
-            if STATE.reload_if_changed():
+            reloaded = STATE.reload_if_changed()
+            if reloaded:
                 self._config_synced = False
         except Exception:
             pass
@@ -6509,6 +6616,8 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
             if not self._config_synced:
                 self._config_synced = True
                 self._update_config_after_login()
+            if reloaded:
+                auto_setup_async()
             return
 
         self._config_synced = False
@@ -6549,6 +6658,10 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
         self._config_synced = False
         try:
             self._sync_config_token()
+        except Exception:
+            pass
+        try:
+            auto_setup_async()
         except Exception:
             pass
         try:
@@ -6700,22 +6813,11 @@ class AnycubicSelectPrinterScript(orca.script.ScriptPluginCapabilityBase):
                 "That printer is no longer on this account.",
             )
         name = printer.get("name") or "printer"
-        ok, message = restart_monitoring_if_running(name)
+        ok, message = start_monitoring_for_selection()
         text = "Selected %s. %s" % (name, message)
         if not ok:
             return orca.ExecutionResult.failure(orca.PluginResult.RecoverableError, text)
         return orca.ExecutionResult.success(message=text)
-
-
-class AnycubicStartMonitorScript(orca.script.ScriptPluginCapabilityBase):
-    def get_name(self):
-        return "Start Monitoring"
-
-    def execute(self):
-        ok, message = start_monitoring()
-        if not ok:
-            return orca.ExecutionResult.failure(orca.PluginResult.RecoverableError, message)
-        return orca.ExecutionResult.success(message=message)
 
 
 class AnycubicStopMonitorScript(orca.script.ScriptPluginCapabilityBase):
@@ -6741,25 +6843,30 @@ class AnycubicCloudPlugin(orca.base):
         fs_read = list(WATCH_PERMISSIONS)
         if log_dir:
             fs_read.extend([log_dir, os.path.join(log_dir, "*")])
-        orca.request_permissions(
-            fs_read=fs_read,
-            network_http=[
-                "https://cloud-universe.anycubic.com",
-                "https://workbentch.s3.us-east-2.amazonaws.com",
-                "https://workbench.s3.us-east-2.amazonaws.com",
-            ] + KVS_HTTP_PERMISSIONS + AGORA_AP_HTTP_PERMISSIONS,
-            # Canonical https://host grants already cover raw sockets to these
-            # hosts on every port. The MQTT tuple is kept because earlier
-            # releases already persisted it, so upgrading does not ask again.
-            network_socket=[
-                "('', 0)",
-                "('mqtt-universe.anycubic.com', 8883)",
-                "('127.0.0.1', 5766)",
-            ],
-            threading=True,
-        )
+        try:
+            orca.request_permissions(
+                fs_read=fs_read,
+                network_http=[
+                    "https://cloud-universe.anycubic.com",
+                    "https://workbentch.s3.us-east-2.amazonaws.com",
+                    "https://workbench.s3.us-east-2.amazonaws.com",
+                ] + KVS_HTTP_PERMISSIONS + AGORA_AP_HTTP_PERMISSIONS,
+                # Canonical https://host grants already cover raw sockets to these
+                # hosts on every port. The MQTT tuple is kept because earlier
+                # releases already persisted it, so upgrading does not ask again.
+                network_socket=[
+                    "('', 0)",
+                    "('mqtt-universe.anycubic.com', 8883)",
+                    "('127.0.0.1', 5766)",
+                ],
+                threading=True,
+            )
+        except TypeError:
+            # OrcaSlicer 2.5.0-alpha exposed only fs_read. It does not audit
+            # network or thread access, so the filesystem grant is enough to
+            # load there; beta and newer use the full declaration above.
+            orca.request_permissions(fs_read=fs_read)
         orca.register_capability(AnycubicCloudPage)
         orca.register_capability(AnycubicLoginScript)
         orca.register_capability(AnycubicSelectPrinterScript)
-        orca.register_capability(AnycubicStartMonitorScript)
         orca.register_capability(AnycubicStopMonitorScript)

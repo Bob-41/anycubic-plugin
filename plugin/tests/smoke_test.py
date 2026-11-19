@@ -74,7 +74,7 @@ def main():
     package.register_capabilities()
     print("registered capabilities:", [c.__name__ for c in orca_stub.registered])
     print("permissions:", json.dumps(orca_stub.permissions, indent=2))
-    assert len(orca_stub.registered) == 5, "expected 5 capabilities"
+    assert len(orca_stub.registered) == 4, "expected 4 capabilities"
     assert isinstance(orca_stub.permissions[0].get("network_socket"), list)
     assert "('', 0)" in orca_stub.permissions[0]["network_socket"], \
         "paho's local bind must be requested up front"
@@ -557,6 +557,15 @@ def main():
         except urllib.error.HTTPError as exc:
             return exc.code, json.loads(exc.read().decode("utf-8"))
 
+    def bridge_request_raw(url, method="GET", data=None, headers=None):
+        req = urllib.request.Request(
+            url, data=data, method=method, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8", "replace")
+
     def bridge_multipart(filename, content, start):
         boundary = "----anycubic-bridge-smoke"
         chunks = []
@@ -593,8 +602,15 @@ def main():
         assert payload["api"] == "0.1", payload
         assert payload["text"].startswith("OctoPrint"), payload
 
-        code, payload = bridge_request(
+        code, text = bridge_request_raw(
             base + "/api/version", headers={"X-Api-Key": "wrong"})
+        assert code == 401, (code, text)
+        assert "Anycubic Cloud tab" in text and "Print progress" in text, text
+
+        body, content_type = bridge_multipart("denied.gcode", b"G28\n", False)
+        code, payload = bridge_request(
+            base + "/api/files/local", method="POST", data=body,
+            headers={"X-Api-Key": "wrong", "Content-Type": content_type})
         assert code == 401 and "api key" in payload["error"].lower(), (code, payload)
 
         body, content_type = bridge_multipart(
@@ -670,6 +686,10 @@ def main():
     ui = page.get_ui()
     assert "127.0.0.1" in ui and "Octo/Klipper" in ui, "bridge setup card missing"
     assert "bridgeBadge" in ui and "btnBridgeCopy" in ui
+    assert 'id="btnStart"' not in ui, "manual Start monitoring button must be gone"
+    assert 'id="btnStop"' in ui, "Stop monitoring must remain"
+    assert 'id="autoNote"' in ui, "automatic-monitoring note must exist"
+    assert "Monitoring starts automatically" in ui
     print("bridge dashboard card: OK")
 
     # The page must drive printer selection without host dialogs, and without
@@ -700,10 +720,62 @@ def main():
     assert listed["items"] and listed["items"][0]["id"] == 7
     print("picker list: OK", listed["items"])
 
-    page.on_message({"type": "pick_printer", "id": 7})
-    picked = wait_for("printers", lambda m: m.get("closed"))
-    assert picked is not None, "pick_printer did not close the picker"
+    started = []
+    saved_start = module.start_monitoring
+    module.start_monitoring = lambda: (
+        started.append(True) or (True, "Connecting..."))
+    try:
+        page.on_message({"type": "pick_printer", "id": 7})
+        picked = wait_for("printers", lambda m: m.get("closed"))
+        assert picked is not None, "pick_printer did not close the picker"
+        assert started, "selecting a printer must start monitoring"
+    finally:
+        module.start_monitoring = saved_start
     print("picker pick: OK")
+
+    # Auto-setup selects the only printer and starts monitoring. Multiple
+    # printers without a selection must be left for the user.
+    saved_list = module.list_printers
+    saved_select_by_id = module.select_printer_by_id
+    saved_start = module.start_monitoring
+    saved_printer = module.STATE.printer
+    saved_token = module.STATE.workbench_token
+    saved_exp = module.STATE.token_exp
+    saved_notice = (module.STATE.notice, module.STATE.notice_error)
+    auto_calls = []
+    try:
+        module.STATE.workbench_token = "auto-token"
+        module.STATE.token_exp = 0
+        module.STATE.printer = {}
+        module.list_printers = lambda: [{
+            "id": 7, "name": "Test Kobra",
+            "model": "Anycubic Kobra 2 Pro", "online": True,
+        }]
+        module.select_printer_by_id = lambda pid: (
+            auto_calls.append(("select", pid)) or fake[0])
+        module.start_monitoring = lambda: (
+            auto_calls.append(("start",)) or (True, "Connecting..."))
+        ok, message = module._auto_setup_once()
+        assert ok, message
+        assert auto_calls == [("select", 7), ("start",)], auto_calls
+
+        auto_calls.clear()
+        module.STATE.printer = {}
+        module.list_printers = lambda: [
+            {"id": 7, "name": "A", "model": "", "online": True},
+            {"id": 8, "name": "B", "model": "", "online": True},
+        ]
+        ok, message = module._auto_setup_once()
+        assert not auto_calls and not ok and message == "", (ok, message, auto_calls)
+    finally:
+        module.list_printers = saved_list
+        module.select_printer_by_id = saved_select_by_id
+        module.start_monitoring = saved_start
+        module.STATE.printer = saved_printer
+        module.STATE.workbench_token = saved_token
+        module.STATE.token_exp = saved_exp
+        module.STATE.notice, module.STATE.notice_error = saved_notice
+    print("auto-setup: OK")
 
     # ---- print controls: pause / resume / stop (v0.6.3) ------------------
     saved_project = module.STATE.project
@@ -1973,6 +2045,25 @@ def main():
         print("selected printer:", module.STATE.printer.get("name"))
     else:
         print("live login: skipped (set ANYCUBIC_RS256 to test the network path)")
+
+    # OrcaSlicer 2.5.0-alpha exposed only fs_read. The plugin must still load
+    # there instead of aborting registration with a TypeError.
+    saved_request = orca_stub.request_permissions
+    legacy_calls = []
+
+    def fs_read_only(**kwargs):
+        if set(kwargs) - {"fs_read"}:
+            raise TypeError(
+                "request_permissions(): incompatible function arguments")
+        legacy_calls.append(kwargs)
+
+    try:
+        orca_stub.request_permissions = fs_read_only
+        package.register_capabilities()
+    finally:
+        orca_stub.request_permissions = saved_request
+    assert legacy_calls and set(legacy_calls[0]) == {"fs_read"}, legacy_calls
+    print("legacy fs_read-only permissions: OK")
 
     print("ALL CHECKS PASSED")
 

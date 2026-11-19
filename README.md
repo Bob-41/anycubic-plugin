@@ -1,132 +1,182 @@
-# Anycubic Cloud Plugin for OrcaSlicer
+# Anycubic Cloud for OrcaSlicer
 
-**Version:** 0.9.0
-**Target:** Anycubic Kobra 2 Pro (and other Anycubic printers using the same cloud API)  
-**Format:** Single-file PEP 723 Python plugin (`anycubic_cloud_any.py`)
+**Live status, cloud uploads, confirmed print controls and the printer camera — inside OrcaSlicer.**
 
----
+Unofficial community plugin for Anycubic's cloud printers. It adds an **Anycubic Cloud** tab to OrcaSlicer, signs in with the token from Anycubic Slicer Next, and drives the printer through the same cloud the mobile app uses.
 
-## What it does
+| Version | Host | Platforms | Printers | License |
+|---|---|---|---|---|
+| 0.9.1 | OrcaSlicer 2.5+ | Windows, macOS, Linux | Anycubic FDM, global cloud | MIT |
 
-This plugin adds a **native dashboard** inside OrcaSlicer for managing Anycubic Cloud printers:
+## Overview
 
-| Feature | Description |
-|---------|-------------|
-| **Live printer status** | Temperatures, print state, layer/progress via MQTT (300 s heartbeat) |
-| **G-code upload** | Watched-folder panel (`~/Downloads` by default) → uploads to Anycubic Cloud → starts print after explicit confirmation |
-| **Direct print from OrcaSlicer** | Local OctoPrint-compatible bridge on `127.0.0.1:5766`. Add it once as an **Octo/Klipper** physical printer, then **Print → Upload and Print**; the plugin uploads to Anycubic Cloud and starts the job. No export folder, no dashboard upload step. |
-| **Print controls** | Pause / Resume / Stop with confirmation dialogs. Only enabled when a job is actually running. Uses HTTP `sendOrder` (orders 2/3/4), not MQTT. |
-| **Webcam panel** | Opens the printer's cloud camera (order 1001) and plays its WebRTC feed. Newer firmware uses **Agora (shengwang)**; older firmware uses **AWS Kinesis Video Streams**. The plugin detects the transport from the response. Stop closes cleanly (order 1002, plus MQTT `stopCapture` on KVS). |
+- **Live status** over MQTT: temperatures, state, layer, progress, times.
+- **Printer picker** for every FDM printer on the account.
+- **Upload and print** `.gcode` / `.gcode.3mf` from a watch folder (default `~/Downloads`) after confirmation.
+- **Direct print** through an OctoPrint-compatible bridge on `127.0.0.1:5766`.
+- **Pause / resume / stop**, each behind a confirmation dialog.
+- **Camera** via Agora (newer firmware) or AWS Kinesis Video Streams (older).
 
----
+Your password is never requested. The printer must stay on Anycubic Cloud, so **leave LAN Mode off** — LAN mode removes it from the cloud, the mobile app and this plugin.
 
 ## Requirements
 
-- OrcaSlicer with Python plugin support (macOS / Linux / Windows)
-- Anycubic account (global region)
-- Printer registered in Anycubic Cloud app
-- OrcaSlicer permissions granted on first run:
-  - Filesystem read: `~/Downloads`, `~/Desktop`, `~/Documents`
-  - Network: `cloud-universe.anycubic.com`, S3, **`kinesisvideo.*.amazonaws.com`**, **`webrtc2-ap-web-*.agora.io`** / **`webrtc2-*.ap.sd-rtn.com`** (for camera)
-  - MQTT socket: `mqtt-universe.anycubic.com:8883`
-  - Local bridge socket: `127.0.0.1:5766` (direct print from OrcaSlicer)
-- OrcaSlicer combines these grants into one confirmation when the plugin is first enabled.
-
----
+- OrcaSlicer **2.5.0+** with Python plugin support.
+- A **global** Anycubic account, with the printer bound to it and **online**.
+- An **FDM** printer. Resin printers are not listed.
+- Approve the permission prompt: `Downloads`/`Desktop`/`Documents`, `cloud-universe.anycubic.com` and S3, `mqtt-universe.anycubic.com:8883`, the Agora/KVS camera hosts, and `127.0.0.1:5766`.
 
 ## Install
 
-1. Download `anycubic_cloud_any.py` (and verify `.sha256` if desired)
-2. In OrcaSlicer: **Preferences → Plugins → Install from file** → select the `.py`
-3. Restart OrcaSlicer
-4. Open the **Anycubic Cloud** page (main window sidebar)
-5. Click **Anycubic Login** → the plugin auto-detects the token from Anycubic Slicer Next logs and pre-fills it; paste it manually (or use **Open log folder**) if detection fails
-6. **Select Printer** → pick your Kobra 2 Pro
-7. **Start Monitoring**
-8. Optional: set up **Direct print from OrcaSlicer** (see below) to send jobs without exporting to the watch folder.
+1. **Plugins → Plugin Hub**, search **Anycubic Cloud**, then **Subscribe / Install**. Or download `anycubic_cloud_any.py` from [Releases](https://github.com/Bob-41/anycubic-plugin/releases/latest) and use **Plugins → Install from file**.
+2. Accept the permissions. If no tab appears, restart OrcaSlicer.
+3. `paho-mqtt` and `cryptography` install automatically on first load; the first start can take up to a minute.
 
----
+## Sign in
 
-## Usage
+The plugin needs the **RS256 access token** from Anycubic Slicer Next — not your password, and not the bridge API key.
+
+1. Sign in to Anycubic Slicer Next and confirm your printer appears.
+2. In OrcaSlicer open **Anycubic Cloud → Anycubic Login** (or **Config**).
+3. The token is pre-filled from Slicer Next logs when found; otherwise paste it.
+4. Click **Sign in → choose a printer**. Monitoring starts automatically when a printer is selected.
+
+If detection fails, search the newest log for `eyJhbGciOiJSUzI1NiIsImtpZCI6ImFjX2FwcF9jcnQi` and copy the whole token:
+
+- Windows: `%APPDATA%\AnycubicSlicerNext\log`
+- macOS: `~/Library/Application Support/AnycubicSlicerNext/log`
+- Linux: `~/.config/AnycubicSlicerNext/log`
+
+Newer Slicer Next builds may not log it; a process dump can recover your own token, but never share the dump. Tokens last about a year and stop working after sign-out or a password change.
+
+## Using it
 
 | Action | How |
-|--------|-----|
-| Direct print from OrcaSlicer | Configure the **Octo/Klipper** physical printer once (below) → **Print** |
-| Upload & print | Dashboard → **Print from folder** → pick file → **Upload & start print** (confirm) |
-| Change watch folder | Dashboard → **Print from folder** → **Change folder** (or the plugin's **Config** tab). Folders must be inside `~/Downloads`, `~/Desktop` or `~/Documents`. |
-| Pause / Resume / Stop | Dashboard → **Current job** → buttons (confirmation required) |
-| Webcam | Dashboard → **Camera** → **Start camera** → live view appears. **Stop camera** when done. |
+|---|---|
+| Status | **Anycubic Cloud** tab |
+| Print from disk | **Print from folder** → file → **Upload & start print** → confirm |
+| Direct print | Set up the bridge below, then **Print → Upload and Print** |
+| Pause / resume / stop | **Current job** buttons, with confirmation |
+| Camera | **Camera → Start camera**, then **Stop camera** when done |
 
----
+The watch folder must be inside `Downloads`, `Desktop` or `Documents`.
 
-## Direct print from OrcaSlicer (localhost bridge)
+### Direct print bridge
 
-The plugin runs a small OctoPrint-compatible bridge on `127.0.0.1:5766`. OrcaSlicer can send a sliced job straight to it, so the watch folder and the dashboard upload button are no longer required.
+1. Wait for **Local bridge: Listening**, then click **Copy API key**.
+2. Add a **Physical Printer** in OrcaSlicer: **Octo/Klipper**, hostname `127.0.0.1:5766`, paste the key.
+3. Click **Test**, then **Print → Upload and Print**.
 
-1. Open the **Anycubic Cloud** page and wait for **Local bridge** to show **Listening**.
-2. Copy the **API key** shown in that card (**Copy API key**).
-3. In OrcaSlicer open **Printer settings → Physical Printer**, choose **Octo/Klipper** as the host type, and enter:
-   - **Hostname:** `127.0.0.1:5766` (Orca hides the separate Port field for this host type, so include the port here)
-   - **API key:** the key from step 2
-4. Click **Test** — OrcaSlicer should report a working OctoPrint connection.
-5. Press **Print**, then click **Upload and Print** in the send dialog. OrcaSlicer sends the G-code to the bridge; the plugin uploads it to Anycubic Cloud and starts it on the printer selected in the dashboard. (Plain **Upload** only stores the file in the cloud.)
+**Test only proves the bridge is reachable.** The plugin must also be signed in, with a printer selected and online, and no job running. Plain **Upload** only stores the file in the cloud.
 
-Notes:
+**The OrcaSlicer Device tab is not the status view.** It shows a message pointing to the **Anycubic Cloud** tab for print progress, temperatures, and the camera. This local bridge only handles print uploads.
 
-- The plugin must be loaded, signed in, and have a printer selected. The printer must be online, and the bridge refuses to start a job while another print is running.
-- Both plain `.gcode` and Orca's optional `.gcode.3mf` bundle are accepted.
-- The bridge listens on loopback only. The API key is generated once and stored in the plugin's `state.json`.
-- The dashboard's folder panel still works; the bridge is an additional path.
-- If the bridge card says **Not running**, read the error shown there: port `5766` may be in use, or the network permission may have been denied.
-- The bridge does **not** expose pause/resume/stop. Those remain confirmed dashboard actions only.
+## Camera
 
----
+- **Monitoring follows the selected printer.** The camera uses the cloud session that monitoring keeps alive.
+- Close the camera in Anycubic Slicer Next and the mobile app: one viewer at a time.
+- Agora or KVS is detected automatically. Press **Stop camera** when done.
 
-## Security / Privacy
+## Troubleshooting
 
-- Your Anycubic credentials **never leave OrcaSlicer**. The plugin exchanges the RS256 JWT for a workbench token locally.
-- The local bridge binds to `127.0.0.1` only and requires the generated API key. It is not reachable from the LAN or the internet.
-- AWS temporary credentials and Agora `rtc_token` / channel keys (from order 1001) stay in plugin memory. On KVS, only the **presigned WSS URL** reaches the dashboard. On Agora, the dashboard receives the edge websocket URL and the join message so the browser can be the WebRTC peer; the channel key is RSA-wrapped for Agora's edge.
-- No telemetry, no external analytics, no auto-updates.
+### "Plugin registration failed: TypeError: request_permissions()"
 
----
+An early **OrcaSlicer 2.5.0-alpha** build accepts only `request_permissions(fs_read=...)`. The plugin also passes `network_http`, `network_socket` and `threading`, so registration aborts with *"incompatible function arguments"* and the plugin shows **Error**. Update OrcaSlicer to **2.5.0 final or 2.5.1** — the released API accepts all arguments. The alpha's plugin API is obsolete and not supported.
 
-## Distribution artifact
+### `DLL load failed while importing _rust` (Windows)
 
-```
-dist/
-├── anycubic_cloud_any.py      # ← upload this to Orca Plugin Hub
-└── anycubic_cloud_any.py.sha256
+This is an **OrcaSlicer packaging issue**, not an account problem. Orca's embedded Python 3.12 can ship `python312.dll` without `python3.dll`, which `cryptography`'s `_rust.pyd` imports. It breaks MQTT and the camera key exchange; the printer list uses plain HTTPS and still works.
+
+With OrcaSlicer closed, check in PowerShell:
+
+```powershell
+$Orca = "C:\Program Files\OrcaSlicer"   # adjust for portable/per-user installs
+$env:PYTHONPATH = "$env:APPDATA\OrcaSlicer\python\packages\cp312"
+Test-Path "$Orca\python\python3.dll"
+& "$Orca\python\python.exe" -c "import cryptography.hazmat.bindings._rust; print('RUST OK')"
 ```
 
-The `_any` suffix is OrcaCloud's universal target. The plugin declares its dependencies (`paho-mqtt`, `cryptography`) in the header and uses only the standard library plus those packages, so the same file runs on macOS, Linux and Windows.
+If `Test-Path` prints `False`, download the official **CPython 3.12.x embeddable** zip ([x64](https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip) / [ARM64](https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-arm64.zip)) and copy only `python3.dll`:
 
----
-
-## Releasing
-
-Every release is built from `master` and published by `.github/workflows/publish-orcacloud.yml`:
-
-```bash
-scripts/release.sh 0.8.3 "## v0.8.3
-- What changed"
+```powershell
+# Administrator PowerShell, OrcaSlicer closed. Use the arm64 URL on ARM64.
+$Orca = "C:\Program Files\OrcaSlicer"
+$zip = "$env:TEMP\python3-embed.zip"
+Invoke-WebRequest "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip" -OutFile $zip
+Expand-Archive $zip "$env:TEMP\py312" -Force
+Copy-Item "$env:TEMP\py312\python3.dll" "$Orca\python\python3.dll" -Force
+Unblock-File "$Orca\python\python3.dll"
 ```
 
-The script bumps the PEP 723 header and `PLUGIN_VERSION`, syncs both `dist/` artifacts and checksums, runs the source and packaged smoke tests, pushes, and creates the GitHub Release with `--target master`.
+Re-run the check: it should print `RUST OK`. Restart OrcaSlicer.
 
-Always tag `master` HEAD. GitHub runs the workflow file from the tagged commit, so tagging an older commit uses that older workflow — the usual cause of a publish that "keeps failing" after a workflow fix.
+> Do **not** rename `python312.dll` to `python3.dll`; they are different files and the fake one can crash Python. Use only the official python.org file.
 
----
+An Orca update or reinstall can remove `python3.dll` again. If it is already present, install the latest **Microsoft Visual C++ 2015–2022 Redistributable** (x64) — `_rust.pyd` also needs `VCRUNTIME140.dll`.
 
-## Verified live (2026-10-27)
+### `ModuleNotFoundError: No module named 'cryptography'`
 
-- Upload → start print ✔
-- Pause / Resume / Stop payloads ✔ (live command gated on explicit user consent)
-- Camera (KVS, older printers): order 1001 → KVS channel ARN → viewer WSS → SigV4 presign → MQTT `startCapture` → **640×480 H.264 over STUN** ✔
-- Camera (Agora, newer firmware): implemented in v0.8.3 with the corrected order-1001 shape; end-to-end verification was pending because the test printer was offline during development.
+The dependency install was interrupted. Reinstall the plugin and let OrcaSlicer finish before closing it.
 
----
+### "Not signed in" / token rejected
+
+- Paste the **whole** token. It starts with `eyJ` and has two dots.
+- Use the RS256 token, not the bridge API key.
+- Take a fresh token from Slicer Next if it expired or you changed your password.
+- To start over, delete `state.json` from the plugin folder, then sign in again.
+
+### Printer list is empty
+
+The list is HTTPS-only, so the `_rust` fix will not change it. Check:
+
+1. You are signed in — the dashboard shows your email.
+2. **LAN Mode is off** and the printer is bound to this account.
+3. The printer is **FDM** and on the **global** cloud.
+4. The printer is online in Anycubic Slicer Next.
+5. Read the picker message:
+   - **"No FDM printers on this Anycubic account."** → the cloud returned nothing. Fix the binding/LAN mode and re-login.
+   - **"Could not load printers: ..."** → HTTP/auth error; the text after the colon is the cause.
+
+### Status never updates
+
+- Select an online printer; monitoring starts automatically.
+- Approve the MQTT permission and allow outbound TCP **8883** to `mqtt-universe.anycubic.com`.
+- VPNs, proxies and strict firewalls often block it.
+
+### Camera will not start / black frame
+
+- Select an online printer; monitoring starts automatically.
+- Close the camera in Slicer Next and the mobile app.
+- **Stop camera**, wait a few seconds, start again.
+- Agora needs UDP; a firewall or VPN that blocks UDP connects without video.
+- On Windows, fix the `_rust` error first.
+
+### Local bridge says "Not running"
+
+- Port **5766** is in use — close the other process and reopen the tab.
+- OrcaSlicer blocked the port — re-enable the plugin and approve the permission.
+- The bridge starts when the tab loads; restart OrcaSlicer after installing.
+
+### Printing fails even though the bridge test passed
+
+The test only checks the local connection. The plugin must be signed in, a printer selected and online, and no job running. The dashboard shows the real reason, e.g. *"The printer is offline on Anycubic Cloud."*
+
+### Logs and bug reports
+
+OrcaSlicer's Python log lives in `%APPDATA%\OrcaSlicer\log` (Windows), `~/Library/Application Support/OrcaSlicer/log` (macOS), or `~/.config/OrcaSlicer/log` (Linux). Include the plugin/Orca versions, OS, printer model and exact error.
+
+**Redact:** RS256 token, workbench token, email, printer serial, bridge key, `state.json`. Never upload a process dump.
+
+## Security and limitations
+
+- The password is never stored. The RS256 token is exchanged for a workbench token cached in `state.json`.
+- The bridge binds to `127.0.0.1` only and requires the generated key.
+- No telemetry or third-party servers.
+- FDM and global cloud only. Resin printers and China-region accounts are unsupported.
+- Cloud-dependent: no cloud, no monitoring or printing. LAN Mode is intentionally not used.
+- One camera viewer at a time. KVS is verified end-to-end; Agora depends on firmware and network.
+- Unofficial API: Anycubic can change it, so updates may be required.
 
 ## License
 
-MIT — see LICENSE (or add your preferred license).
+MIT. Not affiliated with Anycubic or OrcaSlicer.
