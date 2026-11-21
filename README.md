@@ -41,7 +41,7 @@ The plugin needs the **RS256 access token** from Anycubic Slicer Next — not yo
 3. The token is pre-filled from Slicer Next logs when found; otherwise paste it.
 4. Click **Sign in → choose a printer**. Monitoring starts automatically when a printer is selected.
 
-If detection fails, search the newest log for `eyJhbGciOiJSUzI1NiIsImtpZCI6ImFjX2FwcF9jcnQi` and copy the whole token:
+If detection fails, search the newest log for `eyJhbGciOiJSUzI1NiIs` and copy the whole token:
 
 - Windows: `%APPDATA%\AnycubicSlicerNext\log`
 - macOS: `~/Library/Application Support/AnycubicSlicerNext/log`

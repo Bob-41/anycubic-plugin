@@ -602,10 +602,18 @@ def main():
         assert payload["api"] == "0.1", payload
         assert payload["text"].startswith("OctoPrint"), payload
 
+        # The Device tab is a browser (Accept: text/html) and gets the readable
+        # page. OrcaSlicer's upload dialog prints the response body verbatim, so
+        # API clients must get a short JSON error, never markup.
         code, text = bridge_request_raw(
-            base + "/api/version", headers={"X-Api-Key": "wrong"})
+            base + "/api/version",
+            headers={"X-Api-Key": "wrong", "Accept": "text/html,*/*"})
         assert code == 401, (code, text)
         assert "Anycubic Cloud tab" in text and "Print progress" in text, text
+
+        code, payload = bridge_request(
+            base + "/api/version", headers={"X-Api-Key": "wrong"})
+        assert code == 401 and "api key" in payload["error"].lower(), (code, payload)
 
         body, content_type = bridge_multipart("denied.gcode", b"G28\n", False)
         code, payload = bridge_request(
@@ -682,6 +690,37 @@ def main():
     while time.time() < deadline and module._upload_in_flight:
         time.sleep(0.02)
     assert not module._upload_in_flight, "bridge left the upload lock held"
+
+    # A syntax error anywhere in a page script silently kills the whole
+    # dashboard (v0.9.1 froze on "Checking sign-in..."), and Python tests
+    # cannot see it. Compile every shipped page script with node.
+    import re as _re
+    import shutil as _shutil
+    import subprocess as _subprocess
+    node = _shutil.which("node")
+    assert node, "node is required to syntax-check the dashboard JavaScript"
+    pages = {
+        "dashboard": page.get_ui(),
+        "config": page.get_config_ui(),
+        "login dialog": module.LOGIN_DIALOG_HTML,
+    }
+    for label, html in pages.items():
+        scripts = _re.findall(r"<script[^>]*>(.*?)</script>", html, _re.S)
+        assert scripts, "no <script> found in %s" % label
+        for index, code in enumerate(scripts):
+            handle = tempfile.NamedTemporaryFile(
+                "w", suffix=".js", delete=False, encoding="utf-8")
+            handle.write(code)
+            handle.close()
+            try:
+                result = _subprocess.run(
+                    [node, "--check", handle.name],
+                    capture_output=True, text=True, timeout=30)
+            finally:
+                os.unlink(handle.name)
+            assert result.returncode == 0, "%s script %d: %s" % (
+                label, index, result.stderr.strip()[:600])
+    print("page JavaScript syntax: OK")
 
     ui = page.get_ui()
     assert "127.0.0.1" in ui and "Octo/Klipper" in ui, "bridge setup card missing"
@@ -2004,6 +2043,23 @@ def main():
     assert module.STATE.is_logged_in()
     assert module.STATE.reload_if_changed() is False
     print("external state reload: OK")
+
+    # Slicer Next signs tokens with different key ids (ac_app_crt, ac_makeronl,
+    # ...). Auto-detect must key on the RS256 header, not one key id (#1).
+    def fake_rs256(kid):
+        header = base64.urlsafe_b64encode(json.dumps(
+            {"alg": "RS256", "kid": kid}, separators=(",", ":")).encode()).decode().rstrip("=")
+        body = base64.urlsafe_b64encode(b'{"sub":"u","exp":1900000000,"pad":"%s"}' % (b"x" * 120)).decode().rstrip("=")
+        return "%s.%s.%s" % (header, body, "s" * 60)
+
+    for kid in ("ac_app_crt", "ac_makeronl", "ac_other"):
+        token = fake_rs256(kid)
+        assert token.startswith("eyJhbGciOiJSUzI1NiIs"), token[:30]
+        line = "[info] open url https://x/cb?code=1&id_token=%s&state=2\n" % token
+        assert module._token_from_log_text(line) == token, kid
+    assert module._token_from_log_text("id_token=eyJhbGciOiJIUzI1NiJ9.a.b") is None
+    assert module._token_from_log_text("nothing here") is None
+    print("log token detection: OK")
 
     # The login script must open a host window, not call the non-existent show_dialog().
     login = instances[1]
