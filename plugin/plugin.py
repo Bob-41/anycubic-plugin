@@ -8,7 +8,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.9.2"
+# version = "0.9.3"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
