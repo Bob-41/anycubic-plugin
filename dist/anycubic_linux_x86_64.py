@@ -19,9 +19,8 @@ Provides:
   * Script capabilities (Plugins dialog -> Run):
       - "Anycubic Login"     : paste the RS256 access token, exchange it for a
                                workbench token, cache it locally.
-      - "Select Printer"     : pick the Anycubic printer to monitor.
-      - "Start Monitoring"   : connect to Anycubic MQTT and subscribe.
-      - "Stop Monitoring"    : disconnect.
+      - "Select Printer"     : pick the Anycubic printer to monitor. Monitoring
+                                starts automatically when a printer is selected.
   * A custom Config tab (login form) via has_config_ui()/get_config_ui().
   * A "Print from folder" panel on the dashboard: lists G-code from a watched
     folder, uploads it to Anycubic Cloud, and (after explicit confirmation)
@@ -4849,7 +4848,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <span class="muted" id="loginState">Checking sign-in…</span>
     <div class="spacer"></div>
     <button id="btnSelect">Select printer</button>
-    <button id="btnStop">Stop monitoring</button>
   </div>
 
   <div class="muted" id="autoNote" style="display:none">
@@ -5998,12 +5996,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     var autoNote = $("autoNote");
     autoNote.style.display = (printer.name && !d.monitoring) ? "block" : "none";
-
-    $("btnStop").disabled = !d.monitoring;
   }
   B.onMessage(render);
-
-  $("btnStop").onclick = function () { B.postMessage({ type: "stop_monitor" }); };
   $("btnSelect").onclick = function () {
     var box = $("picker");
     box.style.display = "block";
@@ -6464,12 +6458,6 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
                     pass
             refresh_printer()
             refresh_project()
-            self._post_status()
-            return
-
-        if kind == "stop_monitor":
-            ok, message = stop_monitoring()
-            STATE.set_notice(message, error=not ok)
             self._post_status()
             return
 
@@ -7103,15 +7091,6 @@ class AnycubicSelectPrinterScript(orca.script.ScriptPluginCapabilityBase):
         return orca.ExecutionResult.success(message=text)
 
 
-class AnycubicStopMonitorScript(orca.script.ScriptPluginCapabilityBase):
-    def get_name(self):
-        return "Stop Monitoring"
-
-    def execute(self):
-        ok, message = stop_monitoring()
-        return orca.ExecutionResult.success(message=message)
-
-
 # ============================================================================
 # Registration
 # ============================================================================
@@ -7152,4 +7131,3 @@ class AnycubicCloudPlugin(orca.base):
         orca.register_capability(AnycubicCloudPage)
         orca.register_capability(AnycubicLoginScript)
         orca.register_capability(AnycubicSelectPrinterScript)
-        orca.register_capability(AnycubicStopMonitorScript)

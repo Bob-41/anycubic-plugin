@@ -74,7 +74,7 @@ def main():
     package.register_capabilities()
     print("registered capabilities:", [c.__name__ for c in orca_stub.registered])
     print("permissions:", json.dumps(orca_stub.permissions, indent=2))
-    assert len(orca_stub.registered) == 4, "expected 4 capabilities"
+    assert len(orca_stub.registered) == 3, "expected 3 capabilities"
     assert isinstance(orca_stub.permissions[0].get("network_socket"), list)
     assert "('', 0)" in orca_stub.permissions[0]["network_socket"], \
         "paho's local bind must be requested up front"
@@ -747,7 +747,7 @@ def main():
     assert "127.0.0.1" in ui and "Octo/Klipper" in ui, "bridge setup card missing"
     assert "bridgeBadge" in ui and "btnBridgeCopy" in ui
     assert 'id="btnStart"' not in ui, "manual Start monitoring button must be gone"
-    assert 'id="btnStop"' in ui, "Stop monitoring must remain"
+    assert 'id="btnStop"' not in ui, "Stop monitoring button must be gone"
     assert 'id="autoNote"' in ui, "automatic-monitoring note must exist"
     assert "Monitoring starts automatically" in ui
     print("bridge dashboard card: OK")
