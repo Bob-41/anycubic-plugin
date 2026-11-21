@@ -6,7 +6,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.9.1"
+# version = "0.9.2"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -155,7 +155,7 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.9.1"
+PLUGIN_VERSION = "0.9.2"
 
 # Local OctoPrint-compatible bridge. OrcaSlicer's Physical Printer "Octo/Klipper"
 # host type uploads to this loopback server, which forwards the file to Anycubic
@@ -358,6 +358,18 @@ def _jwt_exp(token: str) -> int:
         return 0
 
 
+_LOG_TOKEN_RE = re.compile(
+    r"id_token=(eyJhbGciOiJSUzI1NiIs[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)")
+
+
+def _token_from_log_text(content: str):
+    """Return the first RS256 id_token found in log text, whatever its key id."""
+    match = _LOG_TOKEN_RE.search(content or "")
+    if match and len(match.group(1)) >= 100:
+        return match.group(1)
+    return None
+
+
 def _find_anycubic_log_token():
     """Search Anycubic Slicer Next logs for an RS256 token (id_token URL param)."""
     import glob, os, re
@@ -374,7 +386,6 @@ def _find_anycubic_log_token():
                 os.path.join(appdata, "AnycubicSlicerNext", "log"),
                 os.path.join(appdata, "Anycubic Slicer Next", "log"),
             ])
-    token_re = re.compile(r"id_token=(eyJhbGciOiJSUzI1NiIsImtpZCI6ImFjX2FwcF9jcnQi[^&\s]{100,})")
     for log_dir in log_dirs:
         if not os.path.isdir(log_dir):
             continue
@@ -382,9 +393,9 @@ def _find_anycubic_log_token():
             try:
                 with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
-                m = token_re.search(content)
-                if m:
-                    return m.group(1)
+                found = _token_from_log_text(content)
+                if found:
+                    return found
             except Exception:
                 continue
     return None
@@ -3445,7 +3456,8 @@ class _BridgeHandler(BaseHTTPRequestHandler):
     def _require_auth(self):
         if self._authorized():
             return True
-        if self.command == "GET":
+        accept = str(self.headers.get("Accept", "") or "").lower()
+        if self.command == "GET" and "text/html" in accept:
             self._send_text(401)
         else:
             self._error(
@@ -5174,7 +5186,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     var list = $("pickerList");
     list.innerHTML = "";
     if (d.error) {
-      list.innerHTML = '<div class="muted">' + d.error.replace(/</g, "<") + "</div>";
+      list.innerHTML = '<div class="muted">' + d.error.replace(/</g, "&lt;") + "</div>";
       return;
     }
     var items = d.items;
@@ -5198,7 +5210,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       var badge = p.online
         ? '<span class="badge ok">Online</span>'
         : '<span class="badge off">Offline</span>';
-      row.innerHTML = '<b>' + (p.name || 'Printer').replace(/</g, "<") + '</b>' +
+      row.innerHTML = '<b>' + (p.name || 'Printer').replace(/</g, "&lt;") + '</b>' +
                       '<span class="muted">' + (p.model || '') + '</span>' +
                       '<span class="spacer"></span>' + badge;
       row.onclick = function () {
@@ -5207,7 +5219,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       };
       list.appendChild(row);
     });
-  }}
+  }
+  function camSetBadge(text, cls) {
+    var badge = $("camBadge");
+    badge.textContent = text;
+    badge.className = "badge " + (cls || "off");
+  }
   function camCleanup() {
     if (camTimer) { clearTimeout(camTimer); camTimer = null; }
     var pc = camPC;
@@ -5873,7 +5890,7 @@ CONFIG_UI_HTML = """<!DOCTYPE html>
 
   <label for="token">RS256 access token</label>
   <textarea id="token" rows="6" spellcheck="false"
-    placeholder="Paste the RS256 JWT (starts with eyJhbGciOiJSUzI1NiIsImtpZCI6ImFjX2FwcF9jcnQi...)"></textarea>
+    placeholder="Paste the RS256 JWT (starts with eyJhbGciOiJSUzI1NiIs...)"></textarea>
   <button id="save">Save &amp; sign in</button>
 
   <label for="watch">G-code watch folder</label>
@@ -5890,7 +5907,7 @@ CONFIG_UI_HTML = """<!DOCTYPE html>
       It is issued by Anycubic when you log in to <b>Anycubic Slicer Next</b>.
       Open the app and sign in, then find the token in
       <code>~/Library/Application Support/AnycubicSlicerNext/log/</code>
-      (search for <code>eyJhbGciOiJSUzI1NiIsImtpZCI6ImFjX2FwcF9jcnQi</code>), or capture it
+      (search for <code>eyJhbGciOiJSUzI1NiIs</code>), or capture it
       from the app's login request with a proxy. The token is valid for about a year.
     </div>
   </details>
@@ -5984,7 +6001,7 @@ LOGIN_DIALOG_HTML = """<!DOCTYPE html>
   <div class="muted">
     Paste the <b>RS256 access token</b> issued by Anycubic Slicer Next for your account.
     It is the JWT that starts with
-    <code>eyJhbGciOiJSUzI1NiIsImtpZCI6ImFjX2FwcF9jcnQi</code>.
+    <code>eyJhbGciOiJSUzI1NiIs</code>.
     You can also paste a whole JSON response containing <code>access_token</code>.
   </div>
   <textarea id="token" rows="7" spellcheck="false" placeholder="eyJhbGciOiJSUzI1NiIs..."></textarea>
@@ -6670,6 +6687,10 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
             pass
         try:
             start_bridge()
+        except Exception:
+            pass
+        try:
+            self._post_status()
         except Exception:
             pass
 
