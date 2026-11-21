@@ -489,8 +489,29 @@ def main():
         assert not ok and "offline" in message.lower(), message
         fake_printer["device_status"] = 1
         fake_printer["is_printing"] = 2
-        ok, message = module.start_print(4242)
-        assert not ok and "in progress" in message.lower(), message
+
+        # A cached snapshot that still says "busy" is not evidence of a job: it
+        # stays busy after a print ends. It must not block a new print.
+        module._http_json = lambda *a, **k: {"code": 1, "msg": "Operation successful"}
+        saved_project = module.STATE.project
+        saved_project_ts = module.STATE.project_ts
+        try:
+            module.STATE.project = None
+            module.STATE.project_ts = 0.0
+            ok, message = module.start_print(4242)
+            assert ok, "a stale busy snapshot must not block: %s" % message
+
+            # A genuine running project does block, with the same message.
+            module.STATE.project = {
+                "id": 55, "printer_id": 52074, "print_status": 1,
+                "progress": 42, "settings": "{}"}
+            module.STATE.project_ts = time.time()
+            ok, message = module.start_print(4242)
+            assert not ok and "in progress" in message.lower(), message
+        finally:
+            module.STATE.project = saved_project
+            module.STATE.project_ts = saved_project_ts
+            module._http_json = saved_http
         fake_printer["is_printing"] = 1
         print("start print guards: OK")
 
@@ -2120,6 +2141,391 @@ def main():
         orca_stub.request_permissions = saved_request
     assert legacy_calls and set(legacy_calls[0]) == {"fs_read"}, legacy_calls
     print("legacy fs_read-only permissions: OK")
+
+    # ---- stale printer/project snapshot bug (v0.9.2) -----------------------
+    # The bug: cached HTTP printer snapshot (is_printing=2/busy) or cached HTTP
+    # project (print_status in ACTIVE_PROJECT_STATES) incorrectly reports a
+    # print in progress when the printer is actually idle. The fix: when MQTT is
+    # connected and fresh, trust the live print_payload; when MQTT is stale or
+    # disconnected, be conservative and do not trust stale cached snapshots.
+    saved_printer_state = module.STATE.printer
+    saved_status_payload = module.STATE.status_payload
+    saved_print_payload = module.STATE.print_payload
+    saved_project = module.STATE.project
+    saved_project_ts = module.STATE.project_ts
+    saved_project_error = module.STATE.project_error
+    saved_mqtt_connected = module.STATE.mqtt_connected
+    saved_last_message_ts = module.STATE.last_message_ts
+    saved_workbench_token = module.STATE.workbench_token
+    saved_token_exp = module.STATE.token_exp
+    try:
+        module.STATE.workbench_token = "smoke-token"
+        module.STATE.token_exp = int(time.time()) + 3600
+
+        # Test 1: Stale cloud printer snapshot (is_printing=2/busy) but printer
+        # actually idle. MQTT is disconnected (stale). Should NOT report printing.
+        module.STATE.printer = {
+            "id": 52074, "name": "Test Kobra", "device_status": 1,
+            "is_printing": 2, "machine_type": 20021,
+            "parameter": {"curr_nozzle_temp": 260, "curr_hotbed_temp": 70},
+            "last_update_time": int((time.time() - 300) * 1000),  # 5 min ago
+            "reason": "busy",
+        }
+        module.STATE.project = None
+        module.STATE.project_ts = 0.0
+        module.STATE.project_error = ""
+        module.STATE.status_payload = None
+        module.STATE.print_payload = None
+        module.STATE.mqtt_connected = False
+        module.STATE.last_message_ts = 0.0
+        status = module.build_status()
+        assert status["printing"] is False, "stale printer snapshot should not report printing: %s" % status["printing"]
+        assert status["job"]["active"] is False, "stale printer snapshot should not report active job: %s" % status["job"]
+        assert status["job"]["can_pause"] is False, status["job"]
+        assert status["job"]["can_resume"] is False, status["job"]
+        assert status["job"]["can_stop"] is False, status["job"]
+        ok, msg = module.print_preflight(refresh=False)
+        assert ok is True, "print_preflight should allow print when stale: %s" % msg
+        print("stale printer snapshot ignored: OK")
+
+        # Test 2: Stale cloud project in active state (print_status=1) but job
+        # finished (progress=100). MQTT disconnected. Should NOT report active job.
+        module.STATE.printer = {
+            "id": 52074, "name": "Test Kobra", "device_status": 1,
+            "is_printing": 1, "machine_type": 20021,
+        }
+        module.STATE.project = {
+            "id": 999, "printer_id": 52074, "gcode_name": "old.gcode",
+            "print_status": 1, "pause": 0, "progress": 100, "remain_time": 0,
+            "settings": '{"state":"printing","curr_layer":100,"total_layers":100}',
+        }
+        module.STATE.project_ts = time.time() - 3600  # 1 hour ago
+        module.STATE.status_payload = None
+        module.STATE.print_payload = None
+        module.STATE.mqtt_connected = False
+        module.STATE.last_message_ts = 0.0
+        status = module.build_status()
+        assert status["job"]["active"] is False, "finished project (progress=100) should not be active: %s" % status["job"]
+        assert status["printing"] is False, "finished project should not report printing: %s" % status["printing"]
+        ok, msg = module.print_preflight(refresh=False)
+        assert ok is True, "print_preflight should allow print when project finished: %s" % msg
+        print("finished project not reported active: OK")
+
+        # Test 3: Stale cloud project in downloading state (print_status=4) but
+        # job never started. MQTT disconnected. Should NOT report active job.
+        module.STATE.project = {
+            "id": 998, "printer_id": 52074, "gcode_name": "never_started.gcode",
+            "print_status": 4, "pause": 0, "progress": 0, "remain_time": -1,
+            "settings": '{}',
+        }
+        module.STATE.project_ts = time.time() - 7200  # 2 hours ago
+        status = module.build_status()
+        assert status["job"]["active"] is False, "stalled downloading project should not be active: %s" % status["job"]
+        assert status["printing"] is False, "stalled project should not report printing: %s" % status["printing"]
+        ok, msg = module.print_preflight(refresh=False)
+        assert ok is True, "print_preflight should allow print when project stalled: %s" % msg
+        print("stalled downloading project not reported active: OK")
+
+        # Test 4: Live MQTT (connected, fresh) says printing via print_payload,
+        # but cached printer snapshot says idle (is_printing=1). Should report printing.
+        module.STATE.printer = {
+            "id": 52074, "name": "Test Kobra", "device_status": 1,
+            "is_printing": 1, "machine_type": 20021,
+        }
+        module.STATE.project = None
+        module.STATE.project_ts = 0.0
+        module.STATE.status_payload = {
+            "type": "status", "action": "report",
+            "data": {"device_status": 1, "progress": 50},
+        }
+        module.STATE.print_payload = {
+            "type": "print", "action": "update",
+            "data": {
+                "filename": "live.gcode", "progress": 50,
+                "curr_layer": 25, "total_layers": 50,
+                "print_time": 300, "remain_time": 300,
+            },
+        }
+        module.STATE.mqtt_connected = True
+        module.STATE.last_message_ts = time.time() - 10  # 10 seconds ago (fresh)
+        status = module.build_status()
+        assert status["printing"] is True, "live MQTT printing should be reported: %s" % status["printing"]
+        assert status["job"]["active"] is True, "live MQTT printing should be active job: %s" % status["job"]
+        assert status["print"]["progress"] == 50, status["print"]
+        assert status["print"]["file"] == "live.gcode", status["print"]
+        ok, msg = module.print_preflight(refresh=False)
+        assert ok is False, "print_preflight should block when live printing: %s" % msg
+        assert "in progress" in msg.lower(), msg
+        print("live MQTT printing trusted over cached printer: OK")
+
+        # Test 5: Live MQTT (connected, fresh) says idle (no print_payload or
+        # print_payload shows idle), but cached printer snapshot says busy
+        # (is_printing=2). Should NOT report printing (trust fresh MQTT).
+        module.STATE.printer = {
+            "id": 52074, "name": "Test Kobra", "device_status": 1,
+            "is_printing": 2, "machine_type": 20021,
+            "parameter": {"curr_nozzle_temp": 260, "curr_hotbed_temp": 70},
+            "reason": "busy",
+        }
+        module.STATE.project = None
+        module.STATE.project_ts = 0.0
+        module.STATE.status_payload = {
+            "type": "status", "action": "report",
+            "data": {"device_status": 1, "progress": 0},
+        }
+        module.STATE.print_payload = {
+            "type": "print", "action": "update",
+            "data": {
+                "filename": "", "progress": 0,
+                "curr_layer": 0, "total_layers": 0,
+                "print_time": 0, "remain_time": 0,
+            },
+        }
+        module.STATE.mqtt_connected = True
+        module.STATE.last_message_ts = time.time() - 10  # fresh
+        status = module.build_status()
+        assert status["printing"] is False, "fresh MQTT idle should override stale printer busy: %s" % status["printing"]
+        assert status["job"]["active"] is False, "fresh MQTT idle should mean no active job: %s" % status["job"]
+        ok, msg = module.print_preflight(refresh=False)
+        assert ok is True, "print_preflight should allow when MQTT fresh and idle: %s" % msg
+        print("fresh MQTT idle overrides stale printer busy: OK")
+
+        # Test 6: MQTT connected but STALE (last message > STALE_AFTER). Cached
+        # printer says busy. Should NOT report printing (conservative).
+        module.STATE.printer = {
+            "id": 52074, "name": "Test Kobra", "device_status": 1,
+            "is_printing": 2, "machine_type": 20021,
+            "reason": "busy",
+        }
+        module.STATE.project = None
+        module.STATE.project_ts = 0.0
+        module.STATE.status_payload = {
+            "type": "status", "action": "report",
+            "data": {"device_status": 1, "progress": 0},
+        }
+        module.STATE.print_payload = None
+        module.STATE.mqtt_connected = True
+        module.STATE.last_message_ts = time.time() - 700  # stale (> STALE_AFTER=600)
+        status = module.build_status()
+        assert status["mqtt"]["stale"] is True, "MQTT should be marked stale"
+        assert status["printing"] is False, "stale MQTT should not report printing from cached printer: %s" % status["printing"]
+        assert status["job"]["active"] is False, "stale MQTT should not report active job from cached printer: %s" % status["job"]
+        ok, msg = module.print_preflight(refresh=False)
+        assert ok is True, "print_preflight should allow when MQTT stale: %s" % msg
+        print("stale MQTT ignores cached printer busy: OK")
+
+        # Test 7: Project in preheating state (print_status=6) but MQTT fresh
+        # shows idle. Should NOT report active job.
+        module.STATE.printer = {
+            "id": 52074, "name": "Test Kobra", "device_status": 1,
+            "is_printing": 1, "machine_type": 20021,
+        }
+        module.STATE.project = {
+            "id": 997, "printer_id": 52074, "gcode_name": "preheat.gcode",
+            "print_status": 6, "pause": 0, "progress": 0, "remain_time": -1,
+            "settings": '{"state":"preheating"}',
+        }
+        module.STATE.project_ts = time.time() - 100
+        module.STATE.status_payload = {
+            "type": "status", "action": "report",
+            "data": {"device_status": 1, "progress": 0},
+        }
+        module.STATE.print_payload = {
+            "type": "print", "action": "update",
+            "data": {"filename": "", "progress": 0, "curr_layer": 0, "total_layers": 0, "print_time": 0, "remain_time": 0},
+        }
+        module.STATE.mqtt_connected = True
+        module.STATE.last_message_ts = time.time() - 10
+        status = module.build_status()
+        assert status["job"]["active"] is False, "preheating project overridden by fresh MQTT idle: %s" % status["job"]
+        assert status["printing"] is False, "preheating project overridden by fresh MQTT idle: %s" % status["printing"]
+        ok, msg = module.print_preflight(refresh=False)
+        assert ok is True, "print_preflight should allow when MQTT fresh idle overrides project: %s" % msg
+        print("fresh MQTT idle overrides stale preheating project: OK")
+
+        # A live report that arrives after the job ended keeps progress=100 and
+        # often the finished file's name; neither may count as a running job.
+        module.STATE.printer = {
+            "id": 52074, "name": "Test Kobra", "device_status": 1,
+            "is_printing": 1, "machine_type": 20021,
+        }
+        module.STATE.project = {
+            "id": 996, "printer_id": 52074, "gcode_name": "done.gcode",
+            "print_status": 1, "pause": 0, "progress": 100, "remain_time": 0,
+            "settings": '{"state":"idle"}',
+        }
+        module.STATE.project_ts = time.time() - 60
+        module.STATE.status_payload = None
+        module.STATE.print_payload = {
+            "type": "print", "action": "update",
+            "data": {
+                "filename": "done.gcode", "progress": 100,
+                "curr_layer": 100, "total_layers": 100,
+                "print_time": 3600, "remain_time": 0,
+            },
+        }
+        module.STATE.mqtt_connected = True
+        module.STATE.last_message_ts = time.time() - 10
+        status = module.build_status()
+        assert status["printing"] is False, "a finished live report is not a running job: %s" % status["printing"]
+        assert status["job"]["active"] is False, "a finished live report is not an active job: %s" % status["job"]
+        ok, msg = module.print_preflight(refresh=False)
+        assert ok is True, "print_preflight should allow after the job finished: %s" % msg
+        print("finished live report is not a running job: OK")
+
+        # A live report that still carries the last file's name but shows no
+        # progress and no busy state is an idle printer, not a running job.
+        module.STATE.project = None
+        module.STATE.project_ts = 0.0
+        module.STATE.print_payload = {
+            "type": "print", "action": "update",
+            "data": {
+                "filename": "done.gcode", "progress": 0,
+                "curr_layer": 0, "total_layers": 0,
+                "print_time": 0, "remain_time": 0,
+            },
+        }
+        module.STATE.status_payload = {
+            "type": "status", "action": "report",
+            "data": {"device_status": 1, "progress": 0},
+        }
+        status = module.build_status()
+        assert status["printing"] is False, "a stale filename is not a running job: %s" % status["printing"]
+        assert status["job"]["active"] is False, "a stale filename is not an active job: %s" % status["job"]
+        ok, msg = module.print_preflight(refresh=False)
+        assert ok is True, "print_preflight should allow when idle: %s" % msg
+        print("stale filename is not a running job: OK")
+
+    finally:
+        module.STATE.printer = saved_printer_state
+        module.STATE.status_payload = saved_status_payload
+        module.STATE.print_payload = saved_print_payload
+        module.STATE.project = saved_project
+        module.STATE.project_ts = saved_project_ts
+        module.STATE.project_error = saved_project_error
+        module.STATE.mqtt_connected = saved_mqtt_connected
+        module.STATE.last_message_ts = saved_last_message_ts
+        module.STATE.workbench_token = saved_workbench_token
+        module.STATE.token_exp = saved_token_exp
+    print("stale snapshot bug tests: OK")
+
+    # ---- the bridge API key must never change ------------------------------
+    # It is what the user pastes into OrcaSlicer's printer profile, so it has to
+    # survive plugin updates and reinstalls, which replace the plugin folder and
+    # its state.json.
+    saved_state_key = module.STATE.bridge_api_key
+    derived = module._derive_bridge_api_key()
+    try:
+        module.STATE.bridge_api_key = ""
+        first = module.bridge_api_key()
+        assert first == derived and module.bridge_api_key() == derived, first
+        assert len(first) == 64, first
+        assert all(char in "0123456789abcdef" for char in first), first
+        # Losing the state file (a reinstall) must not rotate the key.
+        module.STATE.bridge_api_key = ""
+        assert module.bridge_api_key() == first, "state loss changed the key"
+        print("bridge api key derivation: OK")
+
+        # A key from a previous install is kept and mirrored into OrcaSlicer's
+        # per-plugin config, so a lost state file recovers it instead of a
+        # freshly generated one.
+        page = module.AnycubicCloudPage()
+        page._config = json.dumps({})
+        page._sync_bridge_key()
+        assert module.STATE.bridge_api_key == first, module.STATE.bridge_api_key
+        mirrored = json.loads(page._config)
+        assert mirrored.get("bridge_api_key") == first, mirrored
+
+        module.STATE.bridge_api_key = ""
+        page._sync_bridge_key()
+        assert module.STATE.bridge_api_key == first, \
+            "state loss did not recover the stored key"
+
+        # A stored key is adopted verbatim, never replaced by a derived one.
+        page._config = json.dumps(
+            {"bridge_api_key": "stored-key-0123456789"})
+        module.STATE.bridge_api_key = ""
+        page._sync_bridge_key()
+        assert module.STATE.bridge_api_key == "stored-key-0123456789", \
+            module.STATE.bridge_api_key
+        print("bridge api key survives updates: OK")
+    finally:
+        module.STATE.bridge_api_key = saved_state_key
+        orca_stub.PythonPluginBase._config = "{}"
+
+    # ---- cryptography must not be needed (Windows MSIX _rust bug) ----------
+    # 0.9.x imported cryptography for RSA; its compiled _rust extension cannot
+    # load in OrcaSlicer's Microsoft Store build ("DLL load failed while
+    # importing _rust"), which took out MQTT and the camera. RSA is done with
+    # the standard library now, so prove both code paths with it unavailable.
+    with open(PLUGIN_PATH, "r", encoding="utf-8") as fh:
+        plugin_source = fh.read()
+    assert "import cryptography" not in plugin_source, "plugin still imports cryptography"
+    assert "from cryptography" not in plugin_source, "plugin still imports cryptography"
+
+    saved_modules = {
+        key: sys.modules.get(key)
+        for key in ("cryptography", "cryptography.hazmat.primitives",
+                    "cryptography.hazmat.primitives.asymmetric")
+    }
+    sys.modules["cryptography"] = None
+    sys.modules["cryptography.hazmat.primitives"] = None
+    sys.modules["cryptography.hazmat.primitives.asymmetric"] = None
+    try:
+        client_id, username, password = module.MqttService()._credentials(
+            "smoke.token.value", "user@example.com")
+        assert client_id.startswith("pcf_") and len(client_id) == 36, client_id
+        assert username.startswith("user|pcf|user@example.com|"), username
+        assert len(password) > 100, password
+        wrapped = module._agora_wrap_key("0123456789abcdef0123456789abcdef")
+        assert len(base64.b64decode(wrapped)) == 128, wrapped
+        print("rsa without cryptography (windows _rust bug): OK")
+    finally:
+        for key, value in saved_modules.items():
+            if value is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = value
+
+    # Cross-check the standard-library RSA against cryptography itself, so the
+    # protocol is proven byte-compatible, not just plausible.
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    except Exception:
+        print("rsa cross-check: skipped (cryptography not importable)")
+    else:
+        broker = module._rsa_numbers(module.BROKER_PUB_PEM.encode("ascii"))
+        expected = serialization.load_pem_public_key(
+            module.BROKER_PUB_PEM.encode("ascii")).public_numbers()
+        assert broker == (expected.n, expected.e), broker[0] == expected.n
+        agora = module._rsa_numbers(base64.b64decode(module.AGORA_PUBLIC_KEY_B64))
+        expected = serialization.load_der_public_key(
+            base64.b64decode(module.AGORA_PUBLIC_KEY_B64)).public_numbers()
+        assert agora == (expected.n, expected.e), agora[0] == expected.n
+
+        private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        numbers = private.public_key().public_numbers()
+        der = private.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        pem = private.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        assert module._rsa_numbers(der) == (numbers.n, numbers.e)
+        assert module._rsa_numbers(pem) == (numbers.n, numbers.e)
+
+        filler = lambda size: b"\x0b" * size
+        payload = b"workbench-token-payload"
+        cipher = module._rsa_pkcs1v15_encrypt(numbers.n, numbers.e, payload, filler)
+        assert private.decrypt(cipher, padding.PKCS1v15()) == payload
+        channel = b"0123456789abcdef0123456789abcdef"
+        cipher = module._rsa_oaep_sha256_encrypt(
+            numbers.n, numbers.e, channel, b"", filler)
+        assert private.decrypt(cipher, padding.OAEP(
+            mgf=padding.MGF1(hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        )) == channel
+        print("rsa cross-check: OK")
 
     print("ALL CHECKS PASSED")
 

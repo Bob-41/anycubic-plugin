@@ -1,6 +1,8 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["paho-mqtt>=2.0.0", "cryptography>=41.0.0"]
+# dependencies = ["paho-mqtt>=2.0.0"]
+# RSA (the MQTT password and Agora's key wrap) is implemented on top of the
+# standard library, so nothing compiled is installed or loaded at runtime.
 #
 # [tool.orcaslicer.plugin]
 # name = "Anycubic Cloud"
@@ -873,16 +875,156 @@ def _agora_id():
     return uuid.uuid4().hex[:6]
 
 
+# ============================================================================
+# RSA (standard library only)
+# ============================================================================
+# The MQTT password and Agora's channel-key wrap are both RSA *public-key*
+# operations. They used `cryptography`, whose wheels ship a compiled `_rust`
+# extension: OrcaSlicer's Microsoft Store (MSIX) build embeds a Python that
+# cannot load it ("DLL load failed while importing _rust"), which took out MQTT
+# and the camera. Both operations need only big-integer arithmetic, so they are
+# done here with pow() and hashlib instead, and cryptography is no longer
+# imported or installed. The smoke test checks the outputs against
+# `cryptography` whenever that library is importable.
+
+
+def _der_load_tlv(buf, offset):
+    """Read one DER TLV. Returns ``(tag, value, next_offset)``."""
+    if not 0 <= offset < len(buf):
+        raise ValueError("truncated DER")
+    tag = buf[offset]
+    offset += 1
+    if tag & 0x1F == 0x1F:
+        raise ValueError("high tag numbers are not supported")
+    if offset >= len(buf):
+        raise ValueError("truncated DER length")
+    if buf[offset] & 0x80:
+        count = buf[offset] & 0x7F
+        offset += 1
+        if count == 0 or count > 4 or offset + count > len(buf):
+            raise ValueError("unsupported DER length")
+        length = int.from_bytes(buf[offset:offset + count], "big")
+        offset += count
+    else:
+        length = buf[offset]
+        offset += 1
+    if offset + length > len(buf):
+        raise ValueError("truncated DER value")
+    return tag, buf[offset:offset + length], offset + length
+
+
+def _rsa_numbers_from_spki(der):
+    """Return ``(n, e)`` from a DER SubjectPublicKeyInfo holding an RSA key."""
+    tag, body, _ = _der_load_tlv(der, 0)
+    if tag != 0x30:
+        raise ValueError("not a DER sequence")
+    tag, _algorithm, after = _der_load_tlv(body, 0)
+    if tag != 0x30:
+        raise ValueError("missing algorithm identifier")
+    tag, bitstring, _ = _der_load_tlv(body, after)
+    if tag != 0x03 or not bitstring:
+        raise ValueError("missing public key bits")
+    if bitstring[0] != 0:
+        raise ValueError("unused bits in the key are not zero")
+    tag, key, _ = _der_load_tlv(bitstring[1:], 0)
+    if tag != 0x30:
+        raise ValueError("not an RSA public key")
+    tag, modulus, offset = _der_load_tlv(key, 0)
+    if tag != 0x02:
+        raise ValueError("missing RSA modulus")
+    tag, exponent, _ = _der_load_tlv(key, offset)
+    if tag != 0x02:
+        raise ValueError("missing RSA exponent")
+    return int.from_bytes(modulus, "big"), int.from_bytes(exponent, "big")
+
+
+_PEM_BLOCK = re.compile(
+    r"-----BEGIN [^-]+-----(.*?)-----END [^-]+-----", re.S)
+
+
+def _rsa_numbers(data):
+    """Accept a PEM string/bytes or raw DER and return ``(n, e)``."""
+    if isinstance(data, str):
+        data = data.encode("ascii", "replace")
+    match = _PEM_BLOCK.search(data.decode("ascii", "replace"))
+    if match:
+        try:
+            data = base64.b64decode("".join(match.group(1).split()), validate=True)
+        except Exception as exc:
+            raise ValueError("bad base64 in PEM: %s" % exc)
+    return _rsa_numbers_from_spki(bytes(data))
+
+
+def _rsa_random(length, rng=None):
+    """Random, non-zero filler bytes; ``rng`` makes tests deterministic."""
+    if length <= 0:
+        return b""
+    if rng is None:
+        chunk = bytearray(os.urandom(length))
+        for index in range(len(chunk)):
+            while chunk[index] == 0:
+                chunk[index] = os.urandom(1)[0]
+        return bytes(chunk)
+    out = bytearray()
+    while len(out) < length:
+        out.extend(rng(length - len(out)))
+    return bytes(out[:length])
+
+
+def _rsa_message_length(n):
+    return (n.bit_length() + 7) // 8
+
+
+def _rsa_pkcs1v15_encrypt(n, e, plaintext, rng=None):
+    """EMSA-PKCS1-v1_5 encryption with the public key ``(n, e)``."""
+    size = _rsa_message_length(n)
+    body = (plaintext if isinstance(plaintext, (bytes, bytearray))
+            else str(plaintext).encode("utf-8"))
+    if len(body) > size - 11:
+        raise ValueError("message too long for this RSA key")
+    filler = _rsa_random(size - len(body) - 3, rng)
+    block = b"\x00\x02" + filler + b"\x00" + body
+    return pow(int.from_bytes(block, "big"), e, n).to_bytes(size, "big")
+
+
+def _mgf1(seed, length, algorithm=hashlib.sha256):
+    out = b""
+    counter = 0
+    while len(out) < length:
+        out += algorithm(seed + counter.to_bytes(4, "big")).digest()
+        counter += 1
+    return out[:length]
+
+
+def _xor_bytes(left, right):
+    return bytes(a ^ b for a, b in zip(left, right))
+
+
+def _rsa_oaep_sha256_encrypt(n, e, plaintext, label=b"", rng=None):
+    """RSAES-OAEP encryption with SHA-256 for both hashes and the mask."""
+    size = _rsa_message_length(n)
+    digest_size = hashlib.sha256().digest_size
+    body = (plaintext if isinstance(plaintext, (bytes, bytearray))
+            else str(plaintext).encode("utf-8"))
+    if len(body) > size - 2 * digest_size - 2:
+        raise ValueError("message too long for this RSA key")
+    label_hash = hashlib.sha256(bytes(label)).digest()
+    data_block = (label_hash
+                  + b"\x00" * (size - len(body) - 2 * digest_size - 2)
+                  + b"\x01" + body)
+    seed = _rsa_random(digest_size, rng)
+    masked_db = _xor_bytes(data_block, _mgf1(seed, len(data_block)))
+    masked_seed = _xor_bytes(seed, _mgf1(masked_db, digest_size))
+    return pow(int.from_bytes(
+        b"\x00" + masked_seed + masked_db, "big"), e, n).to_bytes(size, "big")
+
+
 def _agora_wrap_key(encryption_key):
     """RSA-OAEP/SHA-256 wrap the raw channel string for the join message."""
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import padding
-
     if not encryption_key:
         raise RuntimeError("Agora's channel is encrypted but no key was sent.")
     try:
-        public_key = serialization.load_der_public_key(
-            base64.b64decode(AGORA_PUBLIC_KEY_B64))
+        numbers = _rsa_numbers(base64.b64decode(AGORA_PUBLIC_KEY_B64))
     except Exception as exc:
         raise RuntimeError("Could not load Agora's channel key: %s" % exc)
     plaintext = encryption_key.encode("utf-8")
@@ -890,14 +1032,7 @@ def _agora_wrap_key(encryption_key):
     # Anycubic key is 32 ASCII characters.
     if len(plaintext) > 62:
         raise RuntimeError("The Agora channel key is too long to wrap.")
-    wrapped = public_key.encrypt(
-        plaintext,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None,
-        ),
-    )
+    wrapped = _rsa_oaep_sha256_encrypt(numbers[0], numbers[1], plaintext)
     return base64.b64encode(wrapped).decode("ascii")
 
 
@@ -2169,19 +2304,14 @@ class MqttService:
     # ---- auth helpers ------------------------------------------------------
 
     def _credentials(self, token: str, email: str):
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import padding
-
         try:
             with open(BROKER_PUB_PATH, "rb") as fh:
-                public_key = serialization.load_pem_public_key(fh.read())
+                numbers = _rsa_numbers(fh.read())
         except OSError:
             # Hub-installed single-file plugins have no tls/ directory.
-            public_key = serialization.load_pem_public_key(
-                BROKER_PUB_PEM.encode("ascii"))
-        password = base64.b64encode(
-            public_key.encrypt(token.encode("utf-8"), padding.PKCS1v15())
-        ).decode("ascii")
+            numbers = _rsa_numbers(BROKER_PUB_PEM.encode("ascii"))
+        password = base64.b64encode(_rsa_pkcs1v15_encrypt(
+            numbers[0], numbers[1], token.encode("utf-8"))).decode("ascii")
 
         digest = hashlib.md5(token.encode("utf-8")).hexdigest()
         client_id = "pcf_" + digest
@@ -3117,23 +3247,56 @@ def upload_gcode_bytes(data, name, on_progress=None):
 # Start print (order 1, cloud file)
 # ============================================================================
 
-def _printer_printing(printer=None):
-    """True when the printer reports an active or paused job.
+def _live_print_running(payloads):
+    """True when the live MQTT report shows a job running right now.
 
-    The cloud's ``is_printing`` is 1 = free, 2 = busy (not a boolean).
+    Only the printer's own live stream counts. A report that arrives after the
+    job ended keeps ``progress=100`` and often the finished file's name, and
+    the slower status heartbeat can still carry the previous job's snapshot, so
+    neither a completed percentage nor a stale file name is treated as a running
+    job: only a busy state, or a percentage that has started but not finished.
     """
-    if isinstance(printer, dict):
-        value = printer.get("is_printing")
-        if value in (2, "2"):
-            return True
-        if isinstance(value, str) and value.strip().lower() in ("busy", "printing"):
-            return True
-    with STATE.lock:
-        payloads = [STATE.print_payload, STATE.status_payload]
     state = _find(payloads, ["print_status", "state", "status"])
-    if state is None or isinstance(state, bool):
+    if state is not None and not isinstance(state, bool):
+        if str(state).strip().lower() in BUSY_STATES:
+            return True
+    progress = _progress_percent(payloads)
+    return progress is not None and 0 < progress < 100
+
+
+def _print_in_progress(printer=None):
+    """Is a job running right now, on the best evidence available?
+
+    When MQTT is connected and its report is fresh the printer's own stream is
+    authoritative. Otherwise only the cloud's project record counts, and only
+    when it shows work that has started and not finished: the cached printer
+    snapshot stays ``is_printing=2/busy`` long after a job has ended, so on its
+    own it is not evidence of anything.
+    """
+    with STATE.lock:
+        connected = STATE.mqtt_connected
+        last_message = STATE.last_message_ts
+        payloads = [STATE.print_payload, STATE.status_payload]
+        project = dict(STATE.project) if isinstance(STATE.project, dict) else None
+
+    age = round(_now() - last_message, 1) if last_message else None
+    if connected and age is not None and age <= STALE_AFTER:
+        return _live_print_running(payloads)
+
+    if not project:
         return False
-    return str(state).strip().lower() in BUSY_STATES
+    status = _project_status(project)
+    if status is None:
+        return False
+    progress = _metric_float(project.get("progress"))
+    if status == 1:
+        # "printing" only counts until it reaches 100%; a finished job keeps it.
+        return progress is None or progress < 100
+    if status in ACTIVE_PROJECT_STATES:
+        # downloading/checking/preheating/slicing with nothing done yet is a job
+        # the cloud accepted but the printer never started.
+        return progress is not None and 0 < progress < 100
+    return False
 
 
 def print_preflight(refresh=False):
@@ -3156,8 +3319,12 @@ def print_preflight(refresh=False):
 
     if printer.get("device_status") != 1:
         return False, "The printer is offline on Anycubic Cloud. Bring it online before starting a print."
-    if _printer_printing(printer):
+
+    # The cloud's cached printer snapshot stays busy after a job ends, so a
+    # stale "busy" is not allowed to block this plugin's own Print button.
+    if _print_in_progress(printer):
         return False, "A print is already in progress. This plugin will not interrupt it."
+
     return True, ""
 
 
@@ -3214,7 +3381,7 @@ def start_print(file_id, printer_id=None):
 
     if printer.get("device_status") != 1:
         return False, "The printer is offline on Anycubic Cloud."
-    if _printer_printing(printer):
+    if _print_in_progress(printer):
         return False, "A print is already in progress. This plugin will not interrupt it."
 
     name = printer.get("name") or "the printer"
@@ -3261,18 +3428,58 @@ def _end_upload():
         _upload_in_flight = False
 
 
+_BRIDGE_KEY_SALT = "anycubic-cloud-plugin/bridge/v1"
+
+
+def _derive_bridge_api_key():
+    """A stable API key for this machine.
+
+    The key used to be a random value stored in state.json *inside the plugin
+    folder*. The folder is replaced when the plugin is updated or reinstalled,
+    so that file — and the key with it — could disappear, changing the key the
+    user must paste into OrcaSlicer's printer profile. Deriving it from the
+    machine's own identity instead means there is nothing to lose: the same key
+    is used on every install of this plugin on this computer.
+    """
+    import getpass
+    import platform
+    seed = "|".join([
+        _BRIDGE_KEY_SALT,
+        str(uuid.getnode()),
+        platform.node(),
+        getpass.getuser(),
+    ])
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def _apply_bridge_api_key(key):
+    """Update the live bridge's expected key without restarting it.
+
+    The running server captured the key at startup. When a stored key is
+    recovered from OrcaSlicer's config, the bridge only has to be told; a
+    restart would drop a print in flight.
+    """
+    with BRIDGE.lock:
+        server = BRIDGE.server
+        if server is not None:
+            try:
+                server.api_key = key
+            except Exception:
+                pass
+
+
 def bridge_api_key():
-    """Return the persisted API key, generating it on first use."""
+    """Return the API key for the local bridge.
+
+    Order of preference: an existing key from this install (or recovered from
+    OrcaSlicer's plugin config), otherwise the key derived from this machine.
+    The key is never regenerated, so it survives updates and reinstalls.
+    """
     with STATE.lock:
         key = STATE.bridge_api_key
     if key:
         return key
-    key = uuid.uuid4().hex + uuid.uuid4().hex
-    with STATE.lock:
-        if not STATE.bridge_api_key:
-            STATE.bridge_api_key = key
-            STATE.save()
-        return STATE.bridge_api_key
+    return _derive_bridge_api_key()
 
 
 def _parse_multipart_form(content_type, body):
@@ -3888,11 +4095,22 @@ def build_status():
     temp_payloads = payloads + [parameter if isinstance(parameter, dict) else None]
     notice, notice_error = STATE.take_notice()
     watch = watch_snapshot()
-    job_active = _project_active(project)
-    job_paused = _project_paused(project)
-    job_status = _project_status(project)
-    job_settings = _project_settings(project)
-    printing = _printer_printing(printer) or job_active
+
+    # Whether a job is running is decided in _print_in_progress(): the live MQTT
+    # report when it is fresh, otherwise cloud project evidence that shows work
+    # that has started and not finished. A stale cached printer snapshot that
+    # still says "busy" must not put a job on the dashboard.
+    printing = _print_in_progress(printer)
+    if printing:
+        job_active = True
+        job_paused = _project_paused(project)
+        job_status = _project_status(project)
+        job_settings = _project_settings(project)
+    else:
+        job_active = False
+        job_paused = False
+        job_status = None
+        job_settings = {}
     with STATE.lock:
         upload = dict(STATE.upload) if isinstance(STATE.upload, dict) else None
 
@@ -6232,6 +6450,10 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
         if kind == "poll":
             self._sync_config_token()
             try:
+                self._sync_bridge_key()
+            except Exception:
+                pass
+            try:
                 start_bridge()
             except Exception:
                 pass
@@ -6651,6 +6873,42 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
         STATE.save()
         login_async(token)
 
+    def _sync_bridge_key(self):
+        """Keep the bridge API key stable across plugin updates.
+
+        The key lives in state.json inside the plugin folder, which is replaced
+        on reinstall, so it is mirrored into OrcaSlicer's per-plugin config
+        (kept for the whole subscription) and taken from there when the state
+        file is gone. The generated value is written back to both places so the
+        dashboard, the bridge and the printer profile always agree.
+        """
+        try:
+            raw = self.get_config()
+            config = dict(raw) if isinstance(raw, dict) else json.loads(raw or "{}")
+            if not isinstance(config, dict):
+                config = {}
+        except Exception:
+            config = {}
+        stored = str(config.get("bridge_api_key") or "").strip()
+        with STATE.lock:
+            current = STATE.bridge_api_key
+        key = stored or current or _derive_bridge_api_key()
+
+        if key != current:
+            with STATE.lock:
+                STATE.bridge_api_key = key
+            STATE.save()
+        if key != stored:
+            config["bridge_api_key"] = key
+            try:
+                self.save_config(json.dumps(config))
+            except Exception:
+                pass
+        with BRIDGE.lock:
+            server = BRIDGE.server
+        if server is not None and getattr(server, "api_key", "") != key:
+            _apply_bridge_api_key(key)
+
     def _update_config_after_login(self):
         with STATE.lock:
             email = STATE.email
@@ -6683,6 +6941,10 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
             pass
         try:
             request_watch_refresh(force=True)
+        except Exception:
+            pass
+        try:
+            self._sync_bridge_key()
         except Exception:
             pass
         try:
