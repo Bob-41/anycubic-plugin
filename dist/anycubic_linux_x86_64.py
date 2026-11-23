@@ -8,7 +8,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.9.6"
+# version = "0.9.7"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -156,7 +156,7 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.9.6"
+PLUGIN_VERSION = "0.9.7"
 
 # Local OctoPrint-compatible bridge. OrcaSlicer's Physical Printer "Octo/Klipper"
 # host type uploads to this loopback server, which forwards the file to Anycubic
@@ -2127,9 +2127,13 @@ def login_with_rs256(rs256_token: str):
     if resp.get("code") != 1:
         with STATE.lock:
             STATE.failed_token_sha = _sha256(token)
-        # Include full response for debugging (code 0 often means token invalid/expired)
-        return False, "Login rejected (code %s): %s — full response: %s" % (
-            resp.get("code"), resp.get("msg"), json.dumps(resp))
+        # Include full response for debugging; code 0 = token invalid/expired
+        msg = resp.get("msg") or ""
+        extra = ""
+        if resp.get("code") == 0 and "user info" in msg.lower():
+            extra = " Your RS256 token is expired or invalid. Open Anycubic Slicer Next, sign in, then copy a fresh token from the logs."
+        return False, "Login rejected (code %s): %s%s — full response: %s" % (
+            resp.get("code"), msg, extra, json.dumps(resp))
 
     data = resp.get("data") or {}
     workbench = data.get("token") or ""
