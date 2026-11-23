@@ -8,7 +8,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.9.10"
+# version = "0.9.11"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -156,7 +156,7 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.9.10"
+PLUGIN_VERSION = "0.9.11"
 
 # Local OctoPrint-compatible bridge. OrcaSlicer's Physical Printer "Octo/Klipper"
 # host type uploads to this loopback server, which forwards the file to Anycubic
@@ -3326,11 +3326,14 @@ def _live_print_running(payloads):
     neither a completed percentage nor a stale file name is treated as a running
     job: only a busy state, or a percentage that has started but not finished.
     """
+    progress = _progress_percent(payloads)
+    # Finished job (progress >= 100) is never "running", regardless of state string.
+    if progress is not None and progress >= 100:
+        return False
     state = _find(payloads, ["print_status", "state", "status"])
     if state is not None and not isinstance(state, bool):
         if str(state).strip().lower() in BUSY_STATES:
             return True
-    progress = _progress_percent(payloads)
     return progress is not None and 0 < progress < 100
 
 
