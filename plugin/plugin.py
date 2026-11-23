@@ -217,6 +217,8 @@ CONTROL_ORDERS = {"pause": 2, "resume": 3, "stop": 4}
 CONTROL_VERBS = {"pause": "Pause", "resume": "Resume", "stop": "Stop"}
 # Temperature control order (print-task panel). Exact ID TBD; 5 is a common guess.
 TEMPERATURE_ORDER = 5
+# Fallback order IDs to try if primary fails
+TEMPERATURE_ORDER_FALLBACKS = [5, 6, 7, 8, 9, 10]
 
 # The active-project record is fetched over HTTP, not MQTT. Polling it every
 # few seconds keeps the controls accurate without hammering the cloud.
@@ -4180,21 +4182,33 @@ def set_temperature(nozzle=None, bed=None):
     if bed is not None:
         temp_data["target_hotbed_temp"] = int(bed)
 
-    body = {
-        "order_id": TEMPERATURE_ORDER,
-        "printer_id": int(printer_id),
-        "project_id": int(project_id),
-        "data": temp_data,
-        "ams_info": None,
-        "settings": None,
-    }
-    try:
-        resp = _http_json("POST", SEND_ORDER_PATH, body, token=token, timeout=30)
-    except Exception as exc:
-        return False, "Temperature request failed: %s" % exc
-    if resp.get("code") != 1:
-        return False, "The printer rejected the temperature request: %s" % (
-            resp.get("msg") or "code %s" % resp.get("code"))
+    # Try primary order_id, then fallbacks
+    order_ids = [TEMPERATURE_ORDER] + [o for o in TEMPERATURE_ORDER_FALLBACKS if o != TEMPERATURE_ORDER]
+    last_resp = None
+    for oid in order_ids:
+        body = {
+            "order_id": oid,
+            "printer_id": int(printer_id),
+            "project_id": int(project_id),
+            "data": temp_data,
+            "ams_info": None,
+            "settings": None,
+        }
+        try:
+            resp = _http_json("POST", SEND_ORDER_PATH, body, token=token, timeout=30)
+        except Exception as exc:
+            last_resp = {"code": -1, "msg": str(exc)}
+            continue
+        if resp.get("code") == 1:
+            # Success!
+            break
+        last_resp = resp
+    else:
+        # All attempts failed
+        code = last_resp.get("code") if last_resp else -1
+        msg = last_resp.get("msg") if last_resp else "unknown"
+        return False, "Temperature rejected (code %s): %s — tried order_ids %s" % (
+            code, msg, order_ids)
 
     parts = []
     if nozzle is not None:
