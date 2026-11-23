@@ -6077,6 +6077,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       renderWebcam(d);
       return;
     }
+    if (d && d.type === "temperature_result") {
+      showNotice(d.message, d.ok === false);
+      return;
+    }
     if (d && d.type === "webcam_agora_join") {
       camAgoraJoin(d);
       return;
@@ -6790,7 +6794,8 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
                 ok, message = set_temperature(nozzle, bed)
             except Exception as exc:
                 ok, message = False, "Temperature control failed: %s" % exc
-            STATE.set_notice(message, error=not ok)
+            # Make temperature errors persistent so they stay visible
+            STATE.set_notice(message, error=not ok, persistent=not ok)
             try:
                 page.post_message({
                     "type": "temperature_result",
