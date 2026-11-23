@@ -8,7 +8,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.9.7"
+# version = "0.9.8"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -156,7 +156,7 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.9.7"
+PLUGIN_VERSION = "0.9.8"
 
 # Local OctoPrint-compatible bridge. OrcaSlicer's Physical Printer "Octo/Klipper"
 # host type uploads to this loopback server, which forwards the file to Anycubic
@@ -6192,6 +6192,11 @@ CONFIG_UI_HTML = """<!DOCTYPE html>
       The token is valid for about a year and stops working if you change your password.
     </div>
   </details>
+  <div class="muted" style="margin-top:8px; font-size:11px; opacity:0.8;">
+    <b>Expired token?</b> If login fails with <b>code 0</b> ("Failed to get user info"),
+    your token has expired. Sign in to <b>Anycubic Slicer Next</b> again, then click
+    <b>Save & sign in</b> — the plugin will pick up the fresh token.
+  </div>
 
 <script>
 (function () {
@@ -6283,6 +6288,11 @@ LOGIN_DIALOG_HTML = """<!DOCTYPE html>
     Paste the <b>access token</b> from <b>Anycubic Slicer Next</b> for your account.
     It starts with <code>eyJ...</code>.
     You can also paste the whole JSON response containing <code>access_token</code>.
+  </div>
+  <div class="muted" style="margin-top:8px; font-size:11px; opacity:0.8;">
+    <b>Token expired?</b> If you see "Login rejected (code 0): Failed to get user info",
+    your token has expired. Open <b>Anycubic Slicer Next</b>, sign in, then click
+    <b>Sign in</b> here — the plugin auto-detects the fresh token from logs.
   </div>
   <div id="cachedAccount" class="muted" style="margin-top:6px;"></div>
   <textarea id="token" rows="7" spellcheck="false" placeholder="Paste token here (starts with eyJ...)"></textarea>
