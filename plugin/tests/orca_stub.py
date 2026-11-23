@@ -86,8 +86,9 @@ class PluginResult:
 
 
 class FakeWindow:
-    def __init__(self, on_submit=None):
+    def __init__(self, on_submit=None, html=""):
         self.on_submit = on_submit
+        self.html = html
         self.posted = []
         self.closed = False
 
@@ -122,7 +123,7 @@ class _Ui:
     def create_window(self, html="", title="", width=0, height=0, on_message=None,
                       on_close=None, style=0, on_submit=None):
         self.calls.append(("create_window", title, len(html), width, height, style))
-        window = FakeWindow(on_submit=on_submit)
+        window = FakeWindow(on_submit=on_submit, html=html)
         self.windows.append(window)
         return window
 

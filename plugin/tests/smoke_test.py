@@ -17,6 +17,7 @@ import shutil
 import sys
 import tempfile
 import time
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_PATH = os.environ.get("ANYCUBIC_PLUGIN_PATH") or os.path.join(
@@ -2021,9 +2022,13 @@ def main():
 
     # login_with_rs256 must not raise NameError; exchange is faked.
     saved_http = module._http_json
-    saved_auth = (module.STATE.workbench_token, module.STATE.token_exp, module.STATE.email)
+    saved_auth = (
+        module.STATE.workbench_token, module.STATE.token_exp, module.STATE.email,
+        getattr(module.STATE, "rs256_token", ""),
+        module.STATE.failed_token_sha,
+    )
 
-    def fake_login_http(method, path, body):
+    def fake_login_http(method, path, body, _relogin=False):
         assert path == module.LOGIN_PATH, path
         assert body.get("access_token") == jwt, body
         return {"code": 1, "data": {
@@ -2042,9 +2047,163 @@ def main():
         module._http_json = saved_http
         (module.STATE.workbench_token,
          module.STATE.token_exp,
-         module.STATE.email) = saved_auth
+         module.STATE.email,
+         module.STATE.rs256_token,
+         module.STATE.failed_token_sha) = saved_auth
         module.STATE.save()
     print("login exchange: OK")
+
+    # --- Server-side token rotation (cloud code 10001) ----------------------
+    # The workbench JWT can say it is valid for months while the cloud has
+    # already rotated it. getPrinters then answers code 10001 ("Login
+    # information has expired. Please login again."), but is_logged_in() still
+    # returns True, so the login script said "Already signed in" and the user
+    # could not recover. The plugin must drop the dead token, exchange the
+    # cached RS256 token once, and retry the request.
+
+    class FakeHTTPResponse:
+        def __init__(self, payload):
+            self._body = json.dumps(payload).encode("utf-8")
+
+        def read(self, *_args):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def jwt_with_exp(exp, email="relogin@example.com"):
+        header = base64.urlsafe_b64encode(
+            b'{"alg":"RS256","typ":"JWT"}').decode().rstrip("=")
+        body = base64.urlsafe_b64encode(json.dumps(
+            {"exp": int(exp), "email": email}).encode()).decode().rstrip("=")
+        return "%s.%s.%s" % (header, body, "s" * 32)
+
+    saved_urlopen = urllib.request.urlopen
+    saved_rotation = (
+        module.STATE.workbench_token, module.STATE.token_exp,
+        getattr(module.STATE, "rs256_token", ""),
+        module.STATE.failed_token_sha,
+        module.STATE._last_relogin_attempt,
+    )
+
+    rs256 = jwt_with_exp(time.time() + 300 * 86400)
+    fresh_workbench = jwt_with_exp(time.time() + 3600)
+    seen = []
+
+    def fake_rotated_urlopen(req, timeout=None):
+        token = req.get_header("Xx-token") or ""
+        if module.LOGIN_PATH in req.full_url:
+            seen.append(("login", token))
+            return FakeHTTPResponse({"code": 1, "data": {
+                "token": fresh_workbench,
+                "user": {"user_email": "relogin@example.com"},
+            }})
+        seen.append(("api", token))
+        if token != fresh_workbench:
+            return FakeHTTPResponse({
+                "code": 10001,
+                "msg": "Login information has expired. Please login again.",
+            })
+        return FakeHTTPResponse({"code": 1, "data": []})
+
+    module.STATE.workbench_token = "rotated-away"
+    module.STATE.token_exp = int(time.time()) + 300 * 86400
+    module.STATE.rs256_token = rs256
+    module.STATE.failed_token_sha = ""
+    module.STATE._last_relogin_attempt = 0.0
+    urllib.request.urlopen = fake_rotated_urlopen
+    try:
+        payload = module._http_json(
+            "POST", module.PRINTERS_PATH, {}, token="rotated-away")
+        assert payload.get("code") == 1, payload
+        assert module.STATE.workbench_token == fresh_workbench, \
+            "the cloud's fresh token must replace the rotated one"
+        assert module.STATE.is_logged_in()
+        assert [kind for kind, _ in seen] == ["api", "login", "api"], seen
+        assert seen[2][1] == fresh_workbench, \
+            "the retried request must use the new workbench token"
+    finally:
+        urllib.request.urlopen = saved_urlopen
+    print("auth expiry re-login: OK")
+
+    # Without a cached RS256 token there is nothing to exchange: the dead
+    # workbench token must still be dropped so the login window opens.
+    def fake_expired_urlopen(req, timeout=None):
+        return FakeHTTPResponse({
+            "code": 10001,
+            "msg": "Login information has expired. Please login again.",
+        })
+
+    module.STATE.workbench_token = "rotated-away"
+    module.STATE.token_exp = int(time.time()) + 300 * 86400
+    module.STATE.rs256_token = ""
+    module.STATE.failed_token_sha = ""
+    module.STATE._last_relogin_attempt = 0.0
+    urllib.request.urlopen = fake_expired_urlopen
+    try:
+        payload = module._http_json(
+            "POST", module.PRINTERS_PATH, {}, token="rotated-away")
+        assert payload.get("code") == 10001, payload
+        assert module.STATE.workbench_token == "", \
+            "a cloud-rejected token must not keep is_logged_in() true"
+        assert not module.STATE.is_logged_in(), \
+            "the login script must be able to open its window again"
+    finally:
+        urllib.request.urlopen = saved_urlopen
+    print("auth expiry without RS256: OK")
+
+    # A rejected RS256 token must not trigger a login on every API call.
+    login_calls = []
+
+    def fake_login_fails(req, timeout=None):
+        if module.LOGIN_PATH in req.full_url:
+            login_calls.append(req.full_url)
+            return FakeHTTPResponse({
+                "code": 10001,
+                "msg": "Login information has expired.",
+            })
+        return FakeHTTPResponse({"code": 10001, "msg": "expired"})
+
+    module.STATE.workbench_token = "rotated-away"
+    module.STATE.token_exp = int(time.time()) + 300 * 86400
+    module.STATE.rs256_token = rs256
+    module.STATE.failed_token_sha = ""
+    module.STATE._last_relogin_attempt = 0.0
+    urllib.request.urlopen = fake_login_fails
+    try:
+        module._http_json("POST", module.PRINTERS_PATH, {}, token="rotated-away")
+        assert len(login_calls) == 1, login_calls
+        module._http_json("POST", module.PRINTERS_PATH, {}, token="rotated-away")
+        assert len(login_calls) == 1, \
+            "the failed RS256 token must not be retried within the cooldown"
+        assert module.STATE.failed_token_sha == module._sha256(rs256)
+    finally:
+        urllib.request.urlopen = saved_urlopen
+    print("auth expiry re-login cooldown: OK")
+
+    # The Config tab reads this flag; it must stop saying "Signed in as ..."
+    # once the cloud has rejected the session.
+    page = instances[0]
+    page.save_config(json.dumps({
+        "rs256_token": "", "email": "relogin@example.com", "logged_in": True,
+    }))
+    module.STATE.workbench_token = ""
+    module.STATE.token_exp = 0
+    module.STATE.rs256_token = ""
+    module.STATE.failed_token_sha = ""
+    page._config_synced = True
+    page._sync_config_token()
+    config = json.loads(page.get_config())
+    assert config.get("logged_in") is False, config
+    print("config signed-out flag: OK")
+
+    module.STATE.workbench_token, module.STATE.token_exp, \
+        module.STATE.rs256_token, module.STATE.failed_token_sha, \
+        module.STATE._last_relogin_attempt = saved_rotation
+    module.STATE.save()
 
     # state.json rewritten by another process is picked up without a restart.
     module.STATE.workbench_token = ""
@@ -2095,6 +2254,28 @@ def main():
         print("login window: OK, result:", result.status)
     finally:
         module.STATE.workbench_token = saved_token
+
+    # A cached token is not proof that the cloud still accepts it. Running the
+    # login script while "signed in" must still open the window, or a
+    # server-side rotation strands the user with "Already signed in".
+    saved_login_state = (module.STATE.workbench_token, module.STATE.token_exp,
+                         module.STATE.email)
+    module.STATE.workbench_token = "cached-token"
+    module.STATE.token_exp = int(time.time()) + 3600
+    module.STATE.email = "cached@example.com"
+    try:
+        before = len(orca_stub.ui.windows)
+        result = login.execute()
+        assert len(orca_stub.ui.windows) == before + 1, \
+            "signed-in login script must still open the window"
+        window = orca_stub.ui.windows[-1]
+        assert "cached@example.com" in window.html, \
+            "the window should explain which account is currently cached"
+        window.close()
+        print("login window while signed in: OK, result:", result.status)
+    finally:
+        (module.STATE.workbench_token, module.STATE.token_exp,
+         module.STATE.email) = saved_login_state
 
     # Simulate a Config-tab save: token stored, plugin picks it up on poll.
     token = os.environ.get("ANYCUBIC_RS256", "").strip()

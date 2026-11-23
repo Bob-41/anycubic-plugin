@@ -429,47 +429,101 @@ def _signature(ts: str, nonce: str, version: str = XX_VERSION) -> str:
     return hashlib.md5(prehash.encode("utf-8")).hexdigest().upper()
 
 
-def _http_json(method: str, path: str, body=None, token: str = "", timeout: int = 20):
-    """Perform a signed Anycubic cloud API request, return parsed JSON dict."""
+def _http_json(method: str, path: str, body=None, token: str = "", timeout: int = 20, _relogin: bool = False):
+    """Perform a signed Anycubic cloud API request, return parsed JSON dict.
+
+    Handles server-side token rotation (code 10001): the workbench JWT may say
+    it is valid for months while the cloud has already rotated it. On code 10001
+    we drop the dead token, exchange the cached RS256 token once (with a 60 s
+    cooldown to avoid login storms), and retry the original request.
+
+    The ``_relogin`` parameter is internal: when True the function is being called
+    from within a relogin attempt (e.g. from ``login_with_rs256``) and must not
+    trigger another relogin cycle even if the login endpoint returns 10001.
+    """
     from urllib import request as urlrequest
     from urllib import error as urlerror
 
-    ts = str(int(_now() * 1000))
-    nonce = uuid.uuid4().hex
-    headers = {
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
-        "Content-Type": "application/json; charset=UTF-8" if method != "GET"
-        else "application/x-www-form-urlencoded",
-        "User-Agent": "AnycubicSlicerNext/2.5.8.6 (pcf; anycubic-cloud-plugin)",
-        "XX-Device-Type": DEVICE_TYPE,
-        "XX-IS-CN": IS_CN,
-        "XX-LANGUAGE": LANGUAGE,
-        "XX-Nonce": nonce,
-        "XX-Signature": _signature(ts, nonce),
-        "XX-Timestamp": ts,
-        "XX-Version": XX_VERSION,
-    }
-    if token:
-        headers["XX-Token"] = token
+    def _make_request(tok: str):
+        ts = str(int(_now() * 1000))
+        nonce = uuid.uuid4().hex
+        headers = {
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "Content-Type": "application/json; charset=UTF-8" if method != "GET"
+            else "application/x-www-form-urlencoded",
+            "User-Agent": "AnycubicSlicerNext/2.5.8.6 (pcf; anycubic-cloud-plugin)",
+            "XX-Device-Type": DEVICE_TYPE,
+            "XX-IS-CN": IS_CN,
+            "XX-LANGUAGE": LANGUAGE,
+            "XX-Nonce": nonce,
+            "XX-Signature": _signature(ts, nonce),
+            "XX-Timestamp": ts,
+            "XX-Version": XX_VERSION,
+        }
+        if tok:
+            headers["XX-Token"] = tok
 
-    data = None
-    if body is not None and method != "GET":
-        data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        data = None
+        if body is not None and method != "GET":
+            data = json.dumps(body, separators=(",", ":")).encode("utf-8")
 
-    req = urlrequest.Request(
-        CLOUD_BASE + GATEWAY_PREFIX + path,
-        data=data,
-        headers=headers,
-        method=method,
-    )
+        req = urlrequest.Request(
+            CLOUD_BASE + GATEWAY_PREFIX + path,
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urlrequest.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+        except urlerror.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", "replace") if exc.fp else ""
+            raise RuntimeError("HTTP %s %s: %s" % (exc.code, exc.reason, body_text))
+        return json.loads(raw)
+
+    # First attempt with the provided token
     try:
-        with urlrequest.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", "replace")
-    except urlerror.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", "replace") if exc.fp else ""
-        raise RuntimeError("HTTP %s %s: %s" % (exc.code, exc.reason, body_text))
-    return json.loads(raw)
+        payload = _make_request(token)
+    except RuntimeError as exc:
+        # Network error, not an auth error — bubble up
+        raise
+
+    if payload.get("code") != 10001:
+        return payload
+
+    # Server says the workbench token is expired (code 10001).
+    # Drop it so is_logged_in() returns False and the login script opens.
+    with STATE.lock:
+        STATE.workbench_token = ""
+        STATE.token_exp = 0
+        # Remember the RS256 token we have (if any) for a single re-login attempt.
+        rs256 = STATE.rs256_token or ""
+        last_attempt = STATE._last_relogin_attempt
+
+    # Don't retry on the login endpoint itself (would loop), unless we are
+    # already inside a relogin attempt (then we just return the error).
+    if path == LOGIN_PATH and not _relogin:
+        return payload
+
+    # Cooldown: only one re-login attempt per 60 seconds.
+    if rs256 and (_now() - last_attempt) >= 60.0:
+        with STATE.lock:
+            STATE._last_relogin_attempt = _now()
+        try:
+            ok, message = login_with_rs256(rs256)
+        except Exception:
+            ok = False
+        if ok:
+            # Retry the original request with the fresh workbench token.
+            with STATE.lock:
+                new_token = STATE.workbench_token
+            try:
+                return _make_request(new_token)
+            except RuntimeError:
+                pass  # fall through to return the original 10001
+
+    return payload
 
 
 # ----------------------------------------------------------------------------
@@ -1917,6 +1971,8 @@ class PluginState:
         self.email = ""
         self.printer = None
         self.failed_token_sha = ""
+        self.rs256_token = ""
+        self._last_relogin_attempt = 0.0
         self.status_payload = None
         self.print_payload = None
         self.project = None          # active cloud project (id + pause state)
@@ -1966,6 +2022,8 @@ class PluginState:
         self.email = data.get("email") or ""
         self.printer = data.get("printer") if isinstance(data.get("printer"), dict) else None
         self.failed_token_sha = data.get("failed_token_sha") or ""
+        self.rs256_token = data.get("rs256_token") or ""
+        self._last_relogin_attempt = float(data.get("_last_relogin_attempt") or 0.0)
         self.watch_dir = data.get("watch_dir") or DEFAULT_WATCH_DIR
         self.bridge_api_key = data.get("bridge_api_key") or ""
         self._state_mtime = self._state_file_mtime()
@@ -1988,6 +2046,8 @@ class PluginState:
                 "email": self.email,
                 "printer": self.printer,
                 "failed_token_sha": self.failed_token_sha,
+                "rs256_token": self.rs256_token,
+                "_last_relogin_attempt": self._last_relogin_attempt,
                 "watch_dir": self.watch_dir,
                 "bridge_api_key": self.bridge_api_key,
             }
@@ -2059,11 +2119,14 @@ def login_with_rs256(rs256_token: str):
             "POST",
             LOGIN_PATH,
             {"device_type": DEVICE_TYPE, "access_token": token, "pc_id": STATE.pc_id},
+            _relogin=True,
         )
     except Exception as exc:
         return False, "Login request failed: %s" % exc
 
     if resp.get("code") != 1:
+        with STATE.lock:
+            STATE.failed_token_sha = _sha256(token)
         return False, "Login rejected (code %s): %s" % (resp.get("code"), resp.get("msg"))
 
     data = resp.get("data") or {}
@@ -2082,6 +2145,7 @@ def login_with_rs256(rs256_token: str):
         STATE.workbench_token = workbench
         STATE.token_exp = _jwt_exp(workbench) or int(_now() + 86400)
         STATE.email = email or STATE.email
+        STATE.rs256_token = token
         STATE.failed_token_sha = ""
         STATE.project = None
         STATE.project_ts = 0.0
@@ -6096,13 +6160,13 @@ CONFIG_UI_HTML = """<!DOCTYPE html>
 </head>
 <body>
   <h3>Anycubic Cloud</h3>
-  <div class="muted">Sign in once. The workbench token is cached in the plugin folder.</div>
+  <div class="muted">Sign in with your Anycubic account to use cloud printing and the camera.</div>
 
   <div id="status">Loading…</div>
 
-  <label for="token">RS256 access token</label>
+  <label for="token">Access token (paste from Anycubic Slicer Next)</label>
   <textarea id="token" rows="6" spellcheck="false"
-    placeholder="Paste the RS256 JWT (starts with eyJhbGciOiJSUzI1NiIs...)"></textarea>
+    placeholder="Paste the token from Anycubic Slicer Next logs (starts with eyJ...)"></textarea>
   <button id="save">Save &amp; sign in</button>
 
   <label for="watch">G-code watch folder</label>
@@ -6114,13 +6178,12 @@ CONFIG_UI_HTML = """<!DOCTYPE html>
   </div>
 
   <details>
-    <summary class="muted">Where do I get this token?</summary>
+    <summary class="muted">Where do I get the token?</summary>
     <div class="muted" style="margin-top:8px; line-height:1.5">
-      It is issued by Anycubic when you log in to <b>Anycubic Slicer Next</b>.
-      Open the app and sign in, then find the token in
-      <code>~/Library/Application Support/AnycubicSlicerNext/log/</code>
-      (search for <code>eyJhbGciOiJSUzI1NiIs</code>), or capture it
-      from the app's login request with a proxy. The token is valid for about a year.
+      1. Open <b>Anycubic Slicer Next</b> and sign in with your Anycubic account.<br>
+      2. The token appears in the log files. The plugin can auto-detect it — just click <b>Sign in</b> on the Anycubic Cloud tab.<br>
+      3. Or manually: open the log folder and search for <code>eyJhbGciOiJSUzI1NiIs</code>.<br>
+      The token is valid for about a year and stops working if you change your password.
     </div>
   </details>
 
@@ -6146,7 +6209,7 @@ CONFIG_UI_HTML = """<!DOCTYPE html>
     if (cfg.logged_in && cfg.email) {
       statusEl.textContent = "Signed in as " + cfg.email;
       statusEl.style.color = "#00796b";
-      tokenEl.placeholder = "Already signed in — paste a new token to replace it";
+      tokenEl.placeholder = "Already signed in — paste a new token to switch accounts";
     } else if (cfg.email) {
       statusEl.textContent = "Last account: " + cfg.email + " — not currently signed in";
     } else {
@@ -6211,12 +6274,12 @@ LOGIN_DIALOG_HTML = """<!DOCTYPE html>
 <body>
   <h3>Sign in to Anycubic Cloud</h3>
   <div class="muted">
-    Paste the <b>RS256 access token</b> issued by Anycubic Slicer Next for your account.
-    It is the JWT that starts with
-    <code>eyJhbGciOiJSUzI1NiIs</code>.
-    You can also paste a whole JSON response containing <code>access_token</code>.
+    Paste the <b>access token</b> from <b>Anycubic Slicer Next</b> for your account.
+    It starts with <code>eyJ...</code>.
+    You can also paste the whole JSON response containing <code>access_token</code>.
   </div>
-  <textarea id="token" rows="7" spellcheck="false" placeholder="eyJhbGciOiJSUzI1NiIs..."></textarea>
+  <div id="cachedAccount" class="muted" style="margin-top:6px;"></div>
+  <textarea id="token" rows="7" spellcheck="false" placeholder="Paste token here (starts with eyJ...)"></textarea>
   <div class="hint-row">
     <button id="btnOpenLogs">Open log folder</button>
   </div>
@@ -6848,6 +6911,15 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
             return
 
         self._config_synced = False
+        # The cloud rejected our session (or token expired and we have no RS256 to re-login).
+        # Update the Config tab so it stops saying "Signed in as ...".
+        if config.get("logged_in"):
+            config["logged_in"] = False
+            try:
+                self.save_config(json.dumps(config))
+            except Exception:
+                pass
+
         token = (config.get("rs256_token") or "").strip()
         if not token:
             return
@@ -6992,14 +7064,12 @@ class AnycubicLoginScript(orca.script.ScriptPluginCapabilityBase):
 
     def execute(self):
         ui = orca.host.ui
-        if STATE.is_logged_in():
-            ui.message(
-                "Already signed in as %s.\n\nPaste a new token in the Config tab to switch accounts." % (STATE.email or "your account"),
-                title="Anycubic Cloud",
-                buttons="ok",
-                icon="info",
-            )
-            return orca.ExecutionResult.success(message="Already signed in.")
+        # Always open the window so the user can re-login if the cloud rejected
+        # the cached workbench token (code 10001). The window will show which
+        # account is currently cached so the user knows what to do.
+        cached_email = ""
+        with STATE.lock:
+            cached_email = STATE.email or ""
 
         # Try to auto-detect token from logs BEFORE opening the dialog
         detected_token = _find_anycubic_log_token()
@@ -7020,8 +7090,15 @@ class AnycubicLoginScript(orca.script.ScriptPluginCapabilityBase):
                 login_async(token)
 
         try:
-            # Pass detected token to dialog (pre-fills textarea if found)
+            # Pass detected token and cached email to dialog
             dialog_html = LOGIN_DIALOG_HTML
+            if cached_email:
+                # Inject the cached email so the user sees which account is currently cached
+                inject = 'document.getElementById("cachedAccount").textContent = "Cached account: " + %s;' % json.dumps(cached_email)
+                dialog_html = dialog_html.replace(
+                    'document.getElementById("token").focus();',
+                    inject + '\n      document.getElementById("token").focus();'
+                )
             if detected_token:
                 # Inject the token into the HTML before the script runs
                 inject = 'document.getElementById("token").value = %s; showToast("Token auto-detected from logs.");' % json.dumps(detected_token)
