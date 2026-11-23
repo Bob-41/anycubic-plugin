@@ -2127,7 +2127,9 @@ def login_with_rs256(rs256_token: str):
     if resp.get("code") != 1:
         with STATE.lock:
             STATE.failed_token_sha = _sha256(token)
-        return False, "Login rejected (code %s): %s" % (resp.get("code"), resp.get("msg"))
+        # Include full response for debugging (code 0 often means token invalid/expired)
+        return False, "Login rejected (code %s): %s — full response: %s" % (
+            resp.get("code"), resp.get("msg"), json.dumps(resp))
 
     data = resp.get("data") or {}
     workbench = data.get("token") or ""
