@@ -2127,9 +2127,13 @@ def login_with_rs256(rs256_token: str):
     if resp.get("code") != 1:
         with STATE.lock:
             STATE.failed_token_sha = _sha256(token)
-        # Include full response for debugging (code 0 often means token invalid/expired)
-        return False, "Login rejected (code %s): %s — full response: %s" % (
-            resp.get("code"), resp.get("msg"), json.dumps(resp))
+        # Include full response for debugging; code 0 = token invalid/expired
+        msg = resp.get("msg") or ""
+        extra = ""
+        if resp.get("code") == 0 and "user info" in msg.lower():
+            extra = " Your RS256 token is expired or invalid. Open Anycubic Slicer Next, sign in, then copy a fresh token from the logs."
+        return False, "Login rejected (code %s): %s%s — full response: %s" % (
+            resp.get("code"), msg, extra, json.dumps(resp))
 
     data = resp.get("data") or {}
     workbench = data.get("token") or ""
