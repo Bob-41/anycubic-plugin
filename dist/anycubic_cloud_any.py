@@ -8,7 +8,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.9.13"
+# version = "0.9.14"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -156,7 +156,7 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.9.13"
+PLUGIN_VERSION = "0.9.14"
 
 # Local OctoPrint-compatible bridge. OrcaSlicer's Physical Printer "Octo/Klipper"
 # host type uploads to this loopback server, which forwards the file to Anycubic
@@ -6077,6 +6077,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       renderWebcam(d);
       return;
     }
+    if (d && d.type === "temperature_result") {
+      showNotice(d.message, d.ok === false);
+      return;
+    }
     if (d && d.type === "webcam_agora_join") {
       camAgoraJoin(d);
       return;
@@ -6790,7 +6794,8 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
                 ok, message = set_temperature(nozzle, bed)
             except Exception as exc:
                 ok, message = False, "Temperature control failed: %s" % exc
-            STATE.set_notice(message, error=not ok)
+            # Make temperature errors persistent so they stay visible
+            STATE.set_notice(message, error=not ok, persistent=not ok)
             try:
                 page.post_message({
                     "type": "temperature_result",
