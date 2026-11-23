@@ -3326,11 +3326,14 @@ def _live_print_running(payloads):
     neither a completed percentage nor a stale file name is treated as a running
     job: only a busy state, or a percentage that has started but not finished.
     """
+    progress = _progress_percent(payloads)
+    # Finished job (progress >= 100) is never "running", regardless of state string.
+    if progress is not None and progress >= 100:
+        return False
     state = _find(payloads, ["print_status", "state", "status"])
     if state is not None and not isinstance(state, bool):
         if str(state).strip().lower() in BUSY_STATES:
             return True
-    progress = _progress_percent(payloads)
     return progress is not None and 0 < progress < 100
 
 
