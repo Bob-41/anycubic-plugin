@@ -1990,6 +1990,7 @@ class PluginState:
         self.video_ts = 0.0
         self.notice = ""
         self.notice_error = False
+        self.notice_persistent = False
         self.recent_messages = []
         self.watch_dir = DEFAULT_WATCH_DIR
         self.bridge_api_key = ""
@@ -2069,16 +2070,18 @@ class PluginState:
         with self.lock:
             return bool(self.workbench_token) and (self.token_exp == 0 or _now() < self.token_exp - 60)
 
-    def set_notice(self, text: str, error: bool = False):
+    def set_notice(self, text: str, error: bool = False, persistent: bool = False):
         with self.lock:
             self.notice = text or ""
             self.notice_error = bool(error)
+            self.notice_persistent = bool(persistent)
 
     def take_notice(self):
         with self.lock:
-            text, err = self.notice, self.notice_error
-            self.notice, self.notice_error = "", False
-        return text, err
+            text, err, persistent = self.notice, self.notice_error, self.notice_persistent
+            if not persistent:
+                self.notice, self.notice_error, self.notice_persistent = "", False, False
+        return text, err, persistent
 
     # ---- upload progress ---------------------------------------------------
 
@@ -4160,7 +4163,7 @@ def build_status():
     # dashboard is not empty before the first status/report arrives.
     parameter = printer.get("parameter")
     temp_payloads = payloads + [parameter if isinstance(parameter, dict) else None]
-    notice, notice_error = STATE.take_notice()
+    notice, notice_error, _ = STATE.take_notice()
     watch = watch_snapshot()
 
     # Whether a job is running is decided in _print_in_progress(): the live MQTT
@@ -6456,11 +6459,11 @@ def login_async(token: str) -> bool:
         global _login_in_flight
         try:
             ok, message = login_with_rs256(token)
-            STATE.set_notice(message, error=not ok)
+            STATE.set_notice(message, error=not ok, persistent=not ok)
             if ok:
                 auto_setup_async()
         except Exception as exc:
-            STATE.set_notice("Login failed: %s" % exc, error=True)
+            STATE.set_notice("Login failed: %s" % exc, error=True, persistent=True)
         finally:
             with _login_lock:
                 _login_in_flight = False
