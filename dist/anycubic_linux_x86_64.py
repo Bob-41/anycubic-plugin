@@ -8,7 +8,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.9.14"
+# version = "1.0.0"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -156,7 +156,7 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.9.14"
+PLUGIN_VERSION = "1.0.0"
 
 # Local OctoPrint-compatible bridge. OrcaSlicer's Physical Printer "Octo/Klipper"
 # host type uploads to this loopback server, which forwards the file to Anycubic
@@ -215,10 +215,6 @@ PAUSE_RESUME_PROJECT_STATE = 1
 # Anycubic order IDs for the project control endpoint.
 CONTROL_ORDERS = {"pause": 2, "resume": 3, "stop": 4}
 CONTROL_VERBS = {"pause": "Pause", "resume": "Resume", "stop": "Stop"}
-# Temperature control order (print-task panel). Exact ID TBD; 5 is a common guess.
-TEMPERATURE_ORDER = 5
-# Fallback order IDs to try if primary fails
-TEMPERATURE_ORDER_FALLBACKS = [5, 6, 7, 8, 9, 10]
 
 # The active-project record is fetched over HTTP, not MQTT. Polling it every
 # few seconds keeps the controls accurate without hammering the cloud.
@@ -4140,85 +4136,6 @@ def control_print(action, confirmed=False):
             _control_in_flight = False
 
 
-def set_temperature(nozzle=None, bed=None):
-    """Set nozzle and/or bed temperature on the active print.
-
-    Uses the print-task panel's temperature control order (order_id 5).
-    Only works when there is an active print job on the printer.
-    Returns (ok, message).
-    """
-    if nozzle is None and bed is None:
-        return False, "No temperature specified."
-
-    with STATE.lock:
-        printer = dict(STATE.printer or {})
-        token = STATE.workbench_token
-        logged_in = STATE.is_logged_in()
-    if not logged_in or not token:
-        return False, "Sign in before controlling temperature."
-    printer_id = printer.get("id")
-    if not printer_id:
-        return False, "Select a printer before controlling temperature."
-    device_status = _as_int(printer.get("device_status"))
-    if device_status is not None and device_status != 1:
-        return False, "The printer is offline on Anycubic Cloud."
-
-    try:
-        projects = get_projects()
-    except Exception as exc:
-        return False, "Could not check the current job: %s" % exc
-
-    project = find_active_project(projects, printer_id)
-    if project is None:
-        return False, "Temperature control is only available during an active print."
-    project_id = _as_int(project.get("id"))
-    if project_id is None:
-        return False, "The cloud did not return a project id for the active job."
-
-    # Build temperature data payload
-    temp_data = {}
-    if nozzle is not None:
-        temp_data["target_nozzle_temp"] = int(nozzle)
-    if bed is not None:
-        temp_data["target_hotbed_temp"] = int(bed)
-
-    # Try primary order_id, then fallbacks
-    order_ids = [TEMPERATURE_ORDER] + [o for o in TEMPERATURE_ORDER_FALLBACKS if o != TEMPERATURE_ORDER]
-    last_resp = None
-    for oid in order_ids:
-        body = {
-            "order_id": oid,
-            "printer_id": int(printer_id),
-            "project_id": int(project_id),
-            "data": temp_data,
-            "ams_info": None,
-            "settings": None,
-        }
-        try:
-            resp = _http_json("POST", SEND_ORDER_PATH, body, token=token, timeout=30)
-        except Exception as exc:
-            last_resp = {"code": -1, "msg": str(exc)}
-            continue
-        if resp.get("code") == 1:
-            # Success!
-            break
-        last_resp = resp
-    else:
-        # All attempts failed
-        code = last_resp.get("code") if last_resp else -1
-        msg = last_resp.get("msg") if last_resp else "unknown"
-        return False, "Temperature rejected (code %s): %s — tried order_ids %s" % (
-            code, msg, order_ids)
-
-    parts = []
-    if nozzle is not None:
-        parts.append("nozzle %d°C" % nozzle)
-    if bed is not None:
-        parts.append("bed %d°C" % bed)
-    name = printer.get("name") or "the printer"
-    return True, "Temperature set on %s: %s." % (name, ", ".join(parts))
-
-
 def build_status():
     with STATE.lock:
         printer = dict(STATE.printer or {})
@@ -5053,19 +4970,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="value"><span id="nozzle">—</span>°C</div>
       <div class="label">Nozzle</div>
       <div class="muted" style="margin-top:6px">Target <span id="nozzleTarget">—</span>°C</div>
-      <div style="margin-top:8px; display:flex; gap:6px; align-items:center;">
-        <input id="nozzleSet" type="number" min="0" max="260" step="1" placeholder="Set nozzle °C" style="flex:1; padding:6px; border-radius:5px; border:1px solid var(--orca-border,#ccc); background:var(--orca-bg,#fff); color:var(--orca-fg,#222); font-size:12px;">
-        <button id="btnSetNozzle" style="padding:6px 10px; border-radius:5px; border:1px solid var(--orca-border,#ccc); background:var(--orca-accent,#009688); color:var(--orca-accent-fg,#fff); cursor:pointer; font-size:11px;">Set</button>
-      </div>
     </div>
     <div class="card">
       <div class="value"><span id="bed">—</span>°C</div>
       <div class="label">Bed</div>
       <div class="muted" style="margin-top:6px">Target <span id="bedTarget">—</span>°C</div>
-      <div style="margin-top:8px; display:flex; gap:6px; align-items:center;">
-        <input id="bedSet" type="number" min="0" max="110" step="1" placeholder="Set bed °C" style="flex:1; padding:6px; border-radius:5px; border:1px solid var(--orca-border,#ccc); background:var(--orca-bg,#fff); color:var(--orca-fg,#222); font-size:12px;">
-        <button id="btnSetBed" style="padding:6px 10px; border-radius:5px; border:1px solid var(--orca-border,#ccc); background:var(--orca-accent,#009688); color:var(--orca-accent-fg,#fff); cursor:pointer; font-size:11px;">Set</button>
-      </div>
     </div>
     <div class="card">
       <div class="value" id="printState">—</div>
@@ -6077,10 +5986,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       renderWebcam(d);
       return;
     }
-    if (d && d.type === "temperature_result") {
-      showNotice(d.message, d.ok === false);
-      return;
-    }
     if (d && d.type === "webcam_agora_join") {
       camAgoraJoin(d);
       return;
@@ -6223,17 +6128,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   $("btnCamStart").onclick = camStart;
   $("btnCamReconnect").onclick = camStart;
   $("btnCamStop").onclick = function () { camStop(false); };
-
-  $("btnSetNozzle").onclick = function () {
-    var val = parseInt($("nozzleSet").value, 10);
-    if (isNaN(val)) return;
-    B.postMessage({ type: "set_temperature", nozzle: val });
-  };
-  $("btnSetBed").onclick = function () {
-    var val = parseInt($("bedSet").value, 10);
-    if (isNaN(val)) return;
-    B.postMessage({ type: "set_temperature", bed: val });
-  };
 
   window.addEventListener("beforeunload", function () {
     if (camState !== "idle") {
@@ -6692,10 +6586,6 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
             self._webcam_stop_async()
             return
 
-        if kind == "set_temperature":
-            self._set_temperature_async(data.get("nozzle"), data.get("bed"))
-            return
-
         if kind == "webcam_agora_offer":
             sdp = data.get("sdp") or ""
             if not sdp:
@@ -6785,29 +6675,6 @@ class AnycubicCloudPage(orca.pages.PagesPluginCapabilityBase):
 
         threading.Thread(
             target=worker, name="anycubic-webcam-stop", daemon=True).start()
-
-    def _set_temperature_async(self, nozzle, bed):
-        page = self
-
-        def worker():
-            try:
-                ok, message = set_temperature(nozzle, bed)
-            except Exception as exc:
-                ok, message = False, "Temperature control failed: %s" % exc
-            # Make temperature errors persistent so they stay visible
-            STATE.set_notice(message, error=not ok, persistent=not ok)
-            try:
-                page.post_message({
-                    "type": "temperature_result",
-                    "ok": ok,
-                    "message": message,
-                })
-                page._post_status()
-            except Exception:
-                pass
-
-        threading.Thread(
-            target=worker, name="anycubic-set-temp", daemon=True).start()
 
     def _list_printers_async(self):
         page = self

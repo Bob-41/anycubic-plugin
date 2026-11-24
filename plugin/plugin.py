@@ -8,7 +8,7 @@
 # name = "Anycubic Cloud"
 # description = "Anycubic Cloud device dashboard for OrcaSlicer: login, live printer status, G-code upload, confirmed print controls and a live webcam panel."
 # author = "Anycubic Cloud Print Contributors"
-# version = "0.9.14"
+# version = "1.0.0"
 # ///
 """
 Anycubic Cloud plugin for OrcaSlicer.
@@ -156,7 +156,7 @@ xwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PLUGIN_VERSION = "0.9.14"
+PLUGIN_VERSION = "1.0.0"
 
 # Local OctoPrint-compatible bridge. OrcaSlicer's Physical Printer "Octo/Klipper"
 # host type uploads to this loopback server, which forwards the file to Anycubic
